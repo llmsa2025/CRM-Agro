@@ -267,7 +267,7 @@ let socialWorker: Worker<EnvioSocialJob> | null = null;
 if (isPrimary) {
   socialWorker = new Worker<EnvioSocialJob>(
     SOCIAL_QUEUE,
-    async (job) => {
+    async (job, token) => {
       const desfecho = await runAsSystem(job.data.teamId, () => processarEnvioSocial(job.data, sendSocialDM));
       if (desfecho === "ocupado") {
         await job.moveToDelayed(Date.now() + 20_000 + Math.round(Math.random() * 20_000), token);
@@ -292,7 +292,7 @@ let agroWorker: Worker<BlocoAgro> | null = null;
 if (isPrimary) {
   agroWorker = new Worker<BlocoAgro>(
     AGRO_QUEUE,
-    async (job) => {
+    async (job, token) => {
       const desfecho = await runAsSystem(job.data.teamId, () => processarBlocoAgro(job.data));
       logger.info({ jobId: job.id, fase: job.data.fase, desfecho }, "[agro] bloco processado");
     },
@@ -414,7 +414,7 @@ campaignWorker.on("failed", (job, err) => {
 // IMPORT_CONCURRENCY. Roda em todos os workers (a trava é por time).
 const importWorker = new Worker<ImportacaoJob>(
   IMPORT_QUEUE,
-  async (job) => {
+  async (job, token) => {
     const desfecho = await runAsSystem(job.data.teamId, () => processarImportacao(job.data));
     if (desfecho === "ocupado") {
       await job.moveToDelayed(Date.now() + 15_000 + Math.round(Math.random() * 15_000), token);
