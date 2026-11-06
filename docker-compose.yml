@@ -1,0 +1,103 @@
+# Serviços de apoio para rodar o CRM Agro na sua máquina ou num servidor.
+#
+#   docker compose up -d                       # PostgreSQL + Redis (o mínimo para o app funcionar)
+#   docker compose --profile whatsapp up -d    # + Evolution API (WhatsApp) e o banco dela
+#
+# Todas as portas ficam presas em 127.0.0.1: nada é exposto à internet. Se alguma porta já estiver
+# em uso na sua máquina, troque o número da esquerda (ex.: "127.0.0.1:5433:5432") e ajuste o .env.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crmagro
+      POSTGRES_PASSWORD: crmagro
+      POSTGRES_DB: crmagro
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - crmagro_pg_data:/var/lib/postgresql/data
+      # Cria também o banco crmagro_test (usado só por `pnpm test`).
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crmagro -d crmagro"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - crmagro_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ---- WhatsApp (opcional): Evolution API ----------------------------------------------------------
+  evo-postgres:
+    profiles: ["whatsapp"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: evolution
+      POSTGRES_DB: evolution
+    volumes:
+      - crmagro_evo_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evolution"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  evolution:
+    profiles: ["whatsapp"]
+    # Versão fixa de propósito: trocar a versão da Evolution já quebrou recibos de leitura e exige
+    # reconectar o QR. Para atualizar, teste a nova tag num ambiente separado antes.
+    image: evoapicloud/evolution-api:v2.3.7@sha256:966625532d9076a2381e973a271307d107e6f070450de3abeeea8bd18be07252
+    restart: unless-stopped
+    depends_on:
+      evo-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8081:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # a Evolution chama o webhook do app que roda no host
+    environment:
+      SERVER_URL: http://localhost:8081
+      SERVER_PORT: "8080"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: "postgresql://evolution:evolution@evo-postgres:5432/evolution?schema=evolution_api"
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "false"
+      DATABASE_SAVE_DATA_CHATS: "false"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379/6
+      CACHE_REDIS_PREFIX_KEY: crmagro_evolution
+      AUTHENTICATION_TYPE: apikey
+      # Tem de ser igual ao EVOLUTION_API_KEY do seu .env.
+      AUTHENTICATION_API_KEY: "${EVOLUTION_API_KEY:-troque-esta-chave-da-evolution}"
+      # Nome que aparece em "Aparelhos conectados" no WhatsApp (só vale para conexões novas).
+      CONFIG_SESSION_PHONE_CLIENT: CRM Agro
+      CONFIG_SESSION_PHONE_NAME: Chrome
+      DEL_INSTANCE: "false"
+      LOG_LEVEL: ERROR,WARN,INFO
+      LOG_BAILEYS: error
+    volumes:
+      - crmagro_evolution_data:/evolution/instances
+
+volumes:
+  crmagro_pg_data:
+  crmagro_redis_data:
+  crmagro_evo_pg_data:
+  crmagro_evolution_data:

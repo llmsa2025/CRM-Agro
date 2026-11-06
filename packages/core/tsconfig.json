@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "src",
+    "scripts"
+  ],
+  "exclude": [
+    "src/**/_typecheck_tmp.ts"
+  ]
+}

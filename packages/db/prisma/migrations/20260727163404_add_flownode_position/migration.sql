@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "FlowNode" ADD COLUMN     "posX" DOUBLE PRECISION,
+ADD COLUMN     "posY" DOUBLE PRECISION;

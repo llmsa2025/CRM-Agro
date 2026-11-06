@@ -1,0 +1,15 @@
+export {
+  effectiveDailyLimit,
+  consumeSendQuota,
+  getAccountRateStatus,
+  setAccountPaused,
+  checkAndMaybePauseAccount,
+  esgotarCotaDoDia,
+  devolverCotaDeEnvio,
+  reservarEspacoDeEmail,
+  getPrimaryWhatsAppStatus,
+  invalidarStatusWhatsApp,
+  quandoCaiu,
+  type ConsumeResult,
+  type PrimaryWhatsAppStatus,
+} from "./service";

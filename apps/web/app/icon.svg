@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <!-- Favicon do CRM Agro: broto (duas folhas sobre a haste) num quadrado verde-mata. Mesma geometria do LogoMark em components/brand/logo.tsx. -->
+  <rect width="32" height="32" rx="7" fill="#1F4A3A"/>
+  <path d="M16 25V14" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/>
+  <path d="M16 18c0-4.4-3.2-7-8-7 0 4.4 2.8 7 8 7z" fill="#D4A13A"/>
+  <path d="M16 15c0-4.6 3-7.6 8-7.6 0 4.8-3 7.6-8 7.6z" fill="#E8C25F"/>
+</svg>

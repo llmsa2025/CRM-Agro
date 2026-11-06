@@ -1,0 +1,213 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Identidade v2 — verde-mata + papel.
+ * Valores em HSL sem "hsl()" para funcionar com o Tailwind (hsl(var(--x))).
+ *
+ *  papel      #FFFFFF   fundo da área de conteúdo
+ *  hover      #F0F2F1   hover/ativo discreto, trilho de barra
+ *  linha      #E5E8E6   hairline 1px
+ *  linha-forte#D2D7D4   borda de input/botão secundário
+ *  tinta      #1A1F1C · tinta-2 #505752 · tinta-3 #69706B
+ *  mata       #1F4A3A   marca/ação · mata-escuro #163629 · mata-claro #E4ECE7
+ *  sol        #D4A13A   só no logo e no ativo do menu
+ *  ok #2F7A45 · atenção #9A6212 · erro #A8321E · info #2F5B8A
+ */
+@layer base {
+  :root {
+    --background: 0 0% 100%; /* #FFFFFF papel */
+    --foreground: 140 9% 11%; /* #1A1F1C tinta */
+    --ink-2: 140 3% 33%; /* #505752 */
+    --ink-3: 140 3% 43%; /* #69706B */
+    --card: 0 0% 100%;
+    --card-foreground: 140 9% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 140 9% 11%;
+
+    /* Marca — verde-mata. brand-500 = mata; 600/700 = hover/tinta sobre claro. */
+    --brand-50: 140 14% 96%; /* #F2F5F3 */
+    --brand-100: 142 16% 91%; /* #E4ECE7 mata-claro */
+    --brand-200: 142 16% 84%; /* #CFDDD4 */
+    --brand-300: 147 16% 67%; /* #9DB8A9 */
+    --brand-400: 150 30% 40%; /* #47876A */
+    --brand-500: 158 41% 21%; /* #1F4A3A mata */
+    --brand-600: 158 41% 15%; /* #163629 mata-escuro */
+    --brand-700: 158 40% 12%; /* #12291F */
+    --brand-foreground: 0 0% 100%;
+    --sol: 40 64% 53%; /* #D4A13A */
+
+    --primary: var(--brand-500);
+    --primary-foreground: var(--brand-foreground);
+
+    --secondary: 140 8% 95%; /* #F0F2F1 hover */
+    --secondary-foreground: 140 9% 11%;
+    --muted: 140 8% 95%; /* #F0F2F1 */
+    --muted-foreground: 140 3% 33%; /* #505752 tinta-2 */
+    --accent: 140 8% 95%; /* #F0F2F1 */
+    --accent-foreground: 140 9% 11%;
+
+    /* Status (dicionário único): ok · atenção · erro · info. */
+    --success-100: 140 30% 92%;
+    --success-500: 138 44% 33%; /* #2F7A45 */
+    --success-700: 138 45% 25%;
+    --success-foreground: 0 0% 100%;
+
+    --warning-100: 40 50% 92%;
+    --warning-500: 35 79% 34%; /* #9A6212 */
+    --warning-700: 35 80% 26%;
+    --warning-foreground: 0 0% 100%;
+
+    --danger-100: 10 50% 93%;
+    --danger-500: 9 70% 39%; /* #A8321E */
+    --danger-700: 9 70% 30%;
+    --danger-foreground: 0 0% 100%;
+
+    --info-100: 210 40% 93%;
+    --info-500: 211 49% 36%; /* #2F5B8A */
+    --info-700: 211 50% 28%;
+
+    --destructive: var(--danger-500);
+    --destructive-foreground: var(--danger-foreground);
+
+    --border: 140 7% 90%; /* #E5E8E6 linha */
+    --input: 144 6% 83%; /* #D2D7D4 linha-forte */
+    --ring: var(--brand-500);
+
+    /* Menu lateral (v2.3): verde-mata como superfície de marca. */
+    --sidebar: 158 41% 21%; /* #1F4A3A */
+    --sidebar-foreground: 0 0% 100%;
+    --sidebar-muted: 142 16% 84%; /* #CFDDD4 texto inativo */
+    --sidebar-label: 147 16% 67%; /* #9DB8A9 rótulo de seção */
+    --sidebar-active: 158 34% 27%; /* #2E5D4B item ativo / divisória */
+    --sidebar-border: 158 34% 27%;
+    --sidebar-ok: 139 50% 67%; /* #7FD69B ponto "conectado" sobre verde */
+
+    --radius: 0.375rem; /* 6px */
+  }
+
+  .dark {
+    /* Escuro: mesmo sistema, papel vira grafite-esverdeado; marca clareia p/ contraste. */
+    --background: 150 12% 8%;
+    --foreground: 140 10% 91%;
+    --ink-2: 140 6% 70%;
+    --ink-3: 140 5% 60%;
+    --card: 150 11% 10%;
+    --card-foreground: 140 10% 91%;
+    --popover: 150 11% 12%;
+    --popover-foreground: 140 10% 91%;
+
+    --brand-50: 155 14% 13%;
+    --brand-100: 155 18% 17%;
+    --brand-200: 155 18% 24%;
+    --brand-300: 150 20% 40%;
+    --brand-400: 150 28% 52%;
+    --brand-500: 150 32% 60%; /* verde claro legível sobre escuro */
+    --brand-600: 150 34% 68%;
+    --brand-700: 150 36% 78%;
+    --brand-foreground: 150 12% 8%;
+    --sol: 40 64% 58%;
+
+    --primary: var(--brand-500);
+    --primary-foreground: var(--brand-foreground);
+
+    --secondary: 150 9% 15%;
+    --secondary-foreground: 140 10% 91%;
+    --muted: 150 9% 15%;
+    --muted-foreground: 140 6% 70%;
+    --accent: 150 9% 16%;
+    --accent-foreground: 140 10% 91%;
+
+    --success-100: 140 25% 16%;
+    --success-500: 138 40% 55%;
+    --success-700: 138 45% 70%;
+    --warning-100: 40 30% 16%;
+    --warning-500: 36 70% 58%;
+    --warning-700: 36 75% 72%;
+    --danger-100: 10 30% 16%;
+    --danger-500: 9 65% 62%;
+    --danger-700: 9 70% 74%;
+    --info-100: 210 30% 16%;
+    --info-500: 211 55% 65%;
+    --info-700: 211 60% 76%;
+
+    --destructive: var(--danger-500);
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 150 8% 17%;
+    --input: 150 8% 24%;
+    --ring: var(--brand-500);
+
+    --sidebar: 158 38% 12%;
+    --sidebar-foreground: 0 0% 100%;
+    --sidebar-muted: 142 16% 80%;
+    --sidebar-label: 147 16% 60%;
+    --sidebar-active: 158 34% 20%;
+    --sidebar-border: 158 34% 20%;
+    --sidebar-ok: 139 50% 67%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+  /* Números tabulares onde há alinhamento de colunas. */
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Barra de rolagem discreta (WebKit) — combina com a hairline. */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--input));
+    border: 3px solid hsl(var(--background));
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer utilities {
+  /* Rolagem sem barra visível (menu lateral verde): a barra global acima é
+     pintada com a cor do papel e, sobre o verde, virava uma faixa branca e
+     grossa sempre à mostra. Continua rolando com a roda do mouse, o toque e o
+     teclado — só a barra some (Firefox, Chrome/Safari e Edge antigo). */
+  .rolagem-sem-barra {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .rolagem-sem-barra::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Fundo da thread de conversa: papel liso (sem textura), as bolhas dão o contraste. */
+.wa-bg {
+  background-color: hsl(var(--background));
+}
+
+/* Motion como acabamento (não decoração): quem prefere menos movimento tem
+   animações/transições reduzidas a quase-instantâneas. Acessibilidade. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

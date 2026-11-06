@@ -1,0 +1,85 @@
+name: Demo e prints
+
+# Sobe o app inteiro do zero (banco, migrations, seed demo, build, servidor) e tira os prints das telas.
+# É também a prova de que as instruções do README funcionam num ambiente limpo.
+# Rode manualmente (Actions > Demo e prints > Run workflow). Os prints saem como artefato "prints".
+
+on:
+  workflow_dispatch:
+    inputs:
+      telas:
+        description: "Só estas telas (nomes separados por vírgula, ex.: 15-mapa-satelite). Vazio = todas."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  prints:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: crmagro
+          POSTGRES_PASSWORD: crmagro
+          POSTGRES_DB: crmagro
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U crmagro" --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://crmagro:crmagro@localhost:5432/crmagro
+      DIRECT_URL: postgresql://crmagro:crmagro@localhost:5432/crmagro
+      REDIS_URL: redis://localhost:6379
+      AUTH_SECRET: demo-auth-secret-demo-auth-secret-demo-auth-0000
+      CREDENTIALS_ENCRYPTION_KEY: demo-credentials-key-demo-credentials-key-0000
+      AUTH_URL: http://localhost:3001
+      AUTH_TRUST_HOST: "true"
+      EVOLUTION_API_URL: http://localhost:8081
+      EVOLUTION_API_KEY: demo-evolution-key
+      EVOLUTION_INSTANCE: crmagro
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Migrations
+        run: pnpm --filter @crmagro/db exec prisma migrate deploy
+      - name: Seed demo
+        run: node packages/db/scripts/seed-demo.mjs
+      - name: Build do web
+        run: pnpm --filter @crmagro/web build
+      - name: Subir o app
+        run: |
+          cd apps/web
+          NODE_ENV=production HOSTNAME=127.0.0.1 PORT=3001 nohup node --import tsx server.ts > /tmp/web.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3001/login > /dev/null 2>&1; then echo "app no ar"; exit 0; fi
+            sleep 2
+          done
+          echo "app não subiu"; tail -n 80 /tmp/web.log; exit 1
+      - name: Chromium
+        run: pnpm --filter @crmagro/worker exec playwright-core install --with-deps chromium
+      - name: Prints
+        run: node scripts/demo/screenshots.mjs
+        env:
+          SO: ${{ inputs.telas }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prints
+          path: screenshots
+          if-no-files-found: ignore
+      - name: Log do app
+        if: always()
+        run: tail -n 120 /tmp/web.log || true

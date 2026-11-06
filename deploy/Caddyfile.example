@@ -1,0 +1,9 @@
+# HTTPS automático com Caddy na frente do app. Troque o domínio e aponte o DNS (registro A) para o servidor.
+# Instalação: https://caddyserver.com/docs/install
+#
+# Salve como /etc/caddy/Caddyfile e rode: sudo systemctl reload caddy
+crm.seu-dominio.com {
+	encode zstd gzip
+	# O Next (com Socket.IO) escuta em 127.0.0.1:3001 (scripts/run-web.sh).
+	reverse_proxy 127.0.0.1:3001
+}

@@ -1,0 +1,38 @@
+{
+  "name": "@crmagro/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "postinstall": "prisma generate",
+    "typecheck": "tsc --noEmit",
+    "migrate": "dotenv -e ../../.env -- prisma migrate dev",
+    "migrate:test": "dotenv -e ../../.env -- sh -c 'unset DATABASE_URL_APP DATABASE_URL_APP_WORKER; DATABASE_URL=\"$DATABASE_URL_TEST\" DIRECT_URL=\"$DIRECT_URL_TEST\" prisma migrate deploy'",
+    "seed": "dotenv -e ../../.env -- tsx prisma/seed.ts",
+    "seed:test": "dotenv -e ../../.env -- sh -c 'unset DATABASE_URL_APP DATABASE_URL_APP_WORKER; DATABASE_URL=\"$DATABASE_URL_TEST\" DIRECT_URL=\"$DIRECT_URL_TEST\" tsx prisma/seed.ts'",
+    "studio": "dotenv -e ../../.env -- prisma studio",
+    "generate": "prisma generate",
+    "migrate:deploy": "dotenv -e ../../.env -- prisma migrate deploy",
+    "seed:demo": "dotenv -e ../../.env -- node scripts/seed-demo.mjs",
+    "create-user": "dotenv -e ../../.env -- node scripts/criar-usuario.mjs"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.1.0",
+    "@crmagro/config": "workspace:*",
+    "bcryptjs": "^3.0.3"
+  },
+  "devDependencies": {
+    "dotenv-cli": "^8.0.0",
+    "prisma": "^6.1.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

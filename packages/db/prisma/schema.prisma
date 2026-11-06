@@ -1,0 +1,2254 @@
+// Prisma schema — CRM Agro
+// Modelo de dados completo (§4 da arquitetura) + decisões da PARTE 0 (§12):
+//   - teamId em TODA tabela do cliente (Team é a raiz do tenant, não tem teamId).
+//   - flowSnapshot (Json) no Enrollment.
+//   - índices em Enrollment.nextRunAt e Deal.enteredStageAt.
+//   - identificadores multicanal em ChannelIdentifier (telefone/email viraram
+//     rows; whatsapp guardado em E.164, normalização na camada de serviço).
+
+generator client {
+  provider = "prisma-client-js"
+  // "native" é o VPS (Debian); "rhel-openssl-3.0.x" é a função da Vercel (Amazon Linux). Sem o segundo,
+  // o motor de consulta não vai no pacote da função e o primeiro acesso ao banco falha.
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // dev: conexão direta (IPv6). prod: pooler Supavisor.
+  directUrl = env("DIRECT_URL") // migrations
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum ActivityTipo {
+  whatsapp
+  email
+  call
+  note
+  stage_change
+}
+
+enum Direcao {
+  in
+  out
+}
+
+enum Canal {
+  whatsapp
+  email
+  instagram
+  linkedin
+}
+
+enum ConversationStatus {
+  open
+  pending
+  closed
+}
+
+enum MessageType {
+  text
+  image
+  audio
+  doc
+}
+
+enum MessageStatus {
+  sent
+  delivered
+  read
+  failed
+  bounced // e-mail: rejeitado/bloqueado (bounce) — sinal laranja
+}
+
+enum FunnelTipo {
+  pre_vendas
+  vendas
+  follow_up
+}
+
+enum DealStatus {
+  open
+  won
+  lost
+}
+
+enum TriggerType {
+  contact_created
+  stage_changed
+  tag_added
+  message_received
+  manual
+  schedule
+  webhook
+  // Roda só nos contatos que a pessoa seleciona na tela de Contatos ("Rodar fluxo"). Não dispara sozinho.
+  contacts_selected
+}
+
+// Tipo do fluxo: "prospeccao" fala com contatos (mensagem, e-mail, DM, agente, ligação); "marketing" publica
+// postagens nas redes e não fala com contato. Cada tipo só aceita os seus passos e gatilhos
+// (`flows/tipos.ts`). Definido na criação; não muda depois.
+enum FlowTipo {
+  prospeccao
+  marketing
+  enriquecimento
+}
+
+enum FlowStatus {
+  draft
+  active
+  paused
+  archived
+}
+
+enum FlowNodeType {
+  send_message
+  send_email
+  send_social
+  switch_flow
+  wait
+  typing
+  condition
+  ab_split
+  update_stage
+  create_deal
+  add_tag
+  notify_user
+  http_request
+  ai_agent
+  manual_call
+  sync_name
+  save_history
+  enrich_data
+  // Os dois passos que substituem o enrich_data (o antigo continua valendo).
+  enrich_company
+  enrich_person
+  end
+}
+
+enum EnrollmentStatus {
+  active
+  waiting
+  done
+  failed
+}
+
+enum FlowStepExecutionStatus {
+  running
+  done
+  failed
+  skipped
+}
+
+enum IntegrationTipo {
+  whatsapp
+  instagram
+  gmail
+  webhook
+  nectarcrm
+  maps
+  // Provedores de IA (Fase 6). Credenciais cifradas (encryptCredentials).
+  anthropic
+  openai
+  glm
+  // Tronco SIP / click-to-call (ligações). Credenciais cifradas: sipHost,
+  // sipPort, sipUser, sipPassword (calls/voopi.ts).
+  voopi
+  // Fonte de dados paga (Captação, Enriquecer): chave cifrada em `credentials`, desligada até o admin configurar.
+  cnpja
+}
+
+enum IntegrationStatus {
+  connected
+  disconnected
+  error
+}
+
+enum RelacionamentoStatus {
+  novo
+  ja_conversou
+  cliente
+  opt_out
+}
+
+// Interesse — eixo ORTOGONAL ao relacionamentoStatus. "Já conversou" é estágio
+// do relacionamento; "teve interesse" é o resultado da qualificação. Um contato
+// pode ser ja_conversou + interessado, ou cliente + sem_interesse. Separados de
+// propósito — fundir os dois criaria estados impossíveis. Preenchido à mão
+// (julgamento humano); alimenta filtros, ramificação de fluxo e métricas.
+enum Interesse {
+  nao_avaliado
+  interessado
+  sem_interesse
+  talvez
+}
+
+enum ChannelAccountStatus {
+  connected
+  disconnected
+  error
+}
+
+// Ligações (Call) — direção e máquina de estados. O loop típico é
+// scheduled → ringing → (answered | no_answer | busy | failed) → completed.
+/// Assinaturas de e-mail (várias, nomeadas, com HTML/imagem/estilo). O usuário
+/// escolhe qual usar ao escrever/no passo de fluxo. Tenant-scoped por time.
+/// POR CAIXA (ajuste do dono, 28/09): cada caixa de e-mail tem as suas e a sua
+/// padrão (`isDefault` vale dentro da caixa) — o dono pode ter 2 caixas, cada
+/// uma com a sua assinatura. `channelAccountId` nulo = assinatura antiga do
+/// time sem caixa (time que ainda não conectou e-mail); a primeira caixa
+/// conectada a adota.
+model EmailSignature {
+  id               String   @id @default(uuid())
+  teamId           String
+  channelAccountId String?
+  nome             String
+  html             String // conteúdo HTML da assinatura
+  isDefault        Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  team           Team            @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  channelAccount ChannelAccount? @relation(fields: [channelAccountId], references: [id], onDelete: Cascade)
+
+  @@index([teamId])
+  @@index([channelAccountId])
+}
+
+/// Conversa do assistente de IA — histórico guardado no servidor (não no
+/// cache local), para sincronizar entre dispositivos. `messages` é o array de
+/// mensagens (role/content/tools) em Json. `userId` = de quem é a conversa
+/// (auditoria de isolamento 09/2026): membro vê só as dele; master/admin/"ver
+/// tudo" veem as do time. Linha antiga (null) = só quem vê tudo.
+model AiConversation {
+  id        String   @id @default(uuid())
+  teamId    String
+  userId    String?
+  titulo    String
+  messages  Json // Msg[] { role, content, tools? }
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([teamId, updatedAt])
+  @@index([teamId, userId, updatedAt])
+}
+
+/// Token da extensão de relay residencial. Cada usuário gera o seu em Integrações
+/// e cola na extensão. Guardamos só o HASH (sha256) — o texto puro é mostrado uma
+/// única vez na geração. `tokenPrefix` é um pedaço não-secreto p/ identificar na
+/// lista. Revogável (revokedAt). tenant-scoped (teamId).
+model RelayAgentToken {
+  id          String    @id @default(uuid())
+  teamId      String
+  userId      String?
+  label       String
+  tokenHash   String    @unique // sha256 do token (lookup O(1) por hash)
+  tokenPrefix String // ex.: "rly_ab12" — só p/ exibir/identificar
+  lastUsedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  team Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([teamId])
+}
+
+/// Token de redefinição de senha ("esqueci a senha").
+/// Guarda só o sha256 do token (nunca o texto puro), com expiração curta e
+/// consumo único (usedAt). Não é tenant-scoped por teamId de propósito: o fluxo
+/// roda SEM sessão e a autoridade é o próprio hash único, que aponta 1 usuário —
+/// não há como cruzar times (lookup O(1) por tokenHash). Padrão espelhado do
+/// RelayAgentToken (hash + revogação), mas ligado ao usuário, não ao time.
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique // sha256 do token
+  expiresAt DateTime
+  usedAt    DateTime? // consumo único: setado ao trocar a senha
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// Cadastro de empresa com e-mail e SENHA esperando a confirmação do e-mail
+/// (core/auth/cadastro-com-senha.ts). Nada de time nem de usuário existe antes
+/// da confirmação: a conta só nasce quando o dono da caixa abre o link E digita
+/// a senha do cadastro. Não é tenant-scoped (o time ainda não existe; a
+/// autoridade é o hash único do token). Vários pendentes para o MESMO e-mail
+/// podem coexistir (tentativas de pessoas diferentes): cada um tem o próprio
+/// link e a própria senha, e confirmar um apaga os outros — quem usou o e-mail
+/// de outra pessoa não bloqueia o dono verdadeiro nem ganha acesso.
+/// Guarda só o sha256 do token; reenviar troca o token (o link antigo morre).
+/// A retenção apaga o que venceu (core/retencao).
+model CadastroPendente {
+  id            String   @id @default(uuid())
+  email         String // minúsculo
+  nome          String // nome da pessoa
+  passwordHash  String // bcrypt (calculado no web)
+  empresaNome   String
+  empresaCnpj   String?
+  empresaCidade String?
+  empresaEstado String?
+  tokenHash     String   @unique // sha256 do token do link
+  expiresAt     DateTime // validade do link atual
+  createdAt     DateTime @default(now())
+
+  @@index([email])
+  @@index([expiresAt])
+}
+
+/// Convite para entrar num time (signup por convite — não self-service).
+/// Tenant-scoped (teamId): pertence ao time que convidou. O aceite acontece SEM
+/// sessão, resolvendo o time pelo próprio convite (hash único), nunca por input
+/// do usuário. Guarda só o sha256 do token; expira e é revogável.
+model Invite {
+  id               String    @id @default(uuid())
+  teamId           String
+  email            String // e-mail convidado (lowercase)
+  tokenHash        String    @unique // sha256 do token
+  tokenPrefix      String // ex.: "inv_ab12" — só p/ exibir/identificar na lista
+  invitedByUserId  String?
+  // Papel (RBAC) que o convidado assume ao aceitar. Enum como String:
+  // owner|admin|member|viewer. Novos convites default "member"; o aceite grava
+  // este papel no User (acceptInvite) §1.
+  role             String    @default("member")
+  // O que o convidado leva ao aceitar (mesmos campos do User; ver lá).
+  // `verTudo` é OBSOLETO (convertido para `verTudoEm`), como no User.
+  verTudo          Boolean   @default(false)
+  verTudoEm        String[]  @default([])
+  editarTudoEm     String[]  @default([])
+  permissoesEquipe String[]  @default([])
+  modulos          String[]  @default([])
+  expiresAt        DateTime
+  acceptedAt       DateTime?
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  team      Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  invitedBy User? @relation("InviteAuthor", fields: [invitedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([teamId])
+  @@index([email])
+}
+
+/// Rascunho de captação (staging/pré-recebimento): contatos capturados
+/// (CNPJ/Maps/Instagram) que AINDA NÃO são Contact. O usuário revisa e importa
+/// só os que quiser — o resto é descartado. Não polui a base de contatos.
+model ProspectDraft {
+  id        String   @id @default(uuid())
+  teamId    String
+  origem    String // "cnpj" | "maps" | "instagram"
+  lote      String // agrupa uma captura (uma busca)
+  nome      String
+  empresa   String?
+  cnpj      String?
+  telefone  String?
+  email     String?
+  cidade    String?
+  uf        String?
+  cnae      String?
+  extra     Json?
+  status    String   @default("pendente") // pendente | importado | descartado
+  // Escopo por dono (plano-equipe-permissoes F3): quem rodou a captação (fila por pessoa).
+  ownerId   String?
+  createdAt DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([teamId, origem, status])
+  @@index([teamId, lote])
+}
+
+/// Compromisso/agenda: reunião, ligação, follow-up ou tarefa, opcionalmente
+/// ligado a um contato. Alimenta o menu Agenda e o "motor do dia".
+model Appointment {
+  id                   String            @id @default(uuid())
+  teamId               String
+  contactId            String?
+  titulo               String
+  descricao            String?
+  tipo                 AppointmentType   @default(tarefa)
+  inicio               DateTime
+  fim                  DateTime?
+  status               AppointmentStatus @default(pendente)
+  // OBSOLETO (28/09, Google Agenda): o convidado único virou a tabela
+  // `AppointmentAttendee` (vários por compromisso); a migration copiou o valor
+  // para lá. Fica uma versão para o app antigo não quebrar durante o deploy e
+  // sem uso no código. Remover na próxima migration — ANTES do DROP, repetir o
+  // INSERT ... ON CONFLICT DO NOTHING (pega o que o app antigo gravou durante
+  // o deploy) e guardar na descrição os valores que não têm cara de e-mail
+  //.
+  convidadoEmail       String?
+  // Visita (produto §E): endereço livre ("Fazenda Boa Vista, km 12") e a
+  // coordenada copiada do contato ao criar/trocar o contato da visita. A
+  // "Rota do dia" usa a coordenada ATUAL do contato (a geocodificação melhora
+  // com o tempo) e esta cópia só quando o contato ficou sem coordenada.
+  local                String?
+  latitude             Float?
+  longitude            Float?
+  // Lembrete (Web Push ao responsável) N minutos antes do início; null = sem
+  // lembrete. `lembreteEm` = inicio − lembreteMin, calculado por TRIGGER no
+  // banco (migration appointment_lembrete_em) em todo INSERT/UPDATE, por
+  // qualquer caminho. `lembreteEnviadoEm` é a trava de idempotência do job
+  // agenda-lembrete (não repete em restart nem com 2 workers); o mesmo
+  // trigger a zera quando o horário ou a antecedência mudam.
+  lembreteMin          Int?              @default(30)
+  lembreteEm           DateTime?
+  lembreteEnviadoEm    DateTime?
+  // Dono do compromisso (quem recebe o lembrete e em cuja rota ele entra).
+  // null = do time, sem dono (criado pela automação).
+  responsavelId        String?
+  // Google Agenda (fase 1, 28/09). `origem`: "crmagro" (criado aqui) ou "google"
+  // (evento da agenda da pessoa com um contato do CRM Agro como convidado).
+  origem               String            @default("crmagro")
+  // Evento de dia inteiro vindo do Google (volta para lá como `date`, não `dateTime`).
+  diaInteiro           Boolean           @default(false)
+  // Reunião online: link da videochamada (Google Meet, criado pelo Google).
+  reuniaoLink          String?
+  reuniaoProvedor      String?
+  // Quando os CAMPOS COMUNS com o Google (título, descrição, horário, local,
+  // convidados) mudaram por último: a régua do conflito (decisão 5, vence a
+  // alteração mais recente). Não é o `updatedAt`, que anda com a trava do
+  // lembrete, a transferência de responsável e a limpeza LGPD.
+  camposComunsEm       DateTime          @default(now())
+  // Quem fez a última alteração que o convidado vê (null = sistema/automação).
+  // Só o PRÓPRIO responsável convida pela Agenda Google dele: colega, gestor ou
+  // automação → o convite sai pelo .ics da caixa do time (revisão do #169).
+  alteradoPorId        String?
+  // Canal do convite: quando os convidados foram convidados pela primeira vez
+  // e por qual conexão Google (null com `convitesEm` = pelo .ics). Quem já foi
+  // convidado nunca recebe um segundo convite por outro caminho (reconectar a
+  // agenda, trocar de responsável, pessoa excluída).
+  convitesEm           DateTime?
+  convitesPorConexaoId String?
+  // iCalUID do evento do Google que convidou (canal = uma conexão Google).
+  // Quando aquele Google sai de cena (desconectar, excluir a pessoa, integração
+  // desligada), o .ics de atualização/cancelamento usa ESTE UID: o cliente de
+  // e-mail atualiza a MESMA entrada, sem evento em dobro (3ª revisão do #169).
+  convitesICalUID      String?
+  // Impressão digital dos campos comuns do evento do Google na última vez que
+  // o CRM Agro e o Google ficaram iguais. Sobrevive à perda do vínculo
+  // (desconectar e reconectar): ao religar, diz QUEM mudou enquanto a agenda
+  // estava fora — só o CRM Agro → vai para o Google; só o Google → vem para cá.
+  camposHashNoGoogle   String?
+  // Veio da Agenda Google (evento com um contato) e a dona ainda não confirmou
+  // que é de trabalho: só ela vê — nem o gestor, nem o "ver como". O gatilho
+  // da importação depende do dono do contato, que outras pessoas decidem.
+  privadoAteConfirmar  Boolean           @default(false)
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  team        Team                  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contact     Contact?              @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  responsavel User?                 @relation("AppointmentResponsavel", fields: [responsavelId], references: [id], onDelete: SetNull)
+  convidados  AppointmentAttendee[]
+  vinculos    AppointmentLink[]
+
+  @@index([teamId])
+  @@index([teamId, inicio])
+  @@index([contactId])
+  @@index([responsavelId])
+  // Job agenda-lembrete (cruza times): pendentes numa janela de início.
+  @@index([status, inicio])
+}
+
+/// Tarefa da "lista do dia" marcada como FEITA por um usuário (produto §F).
+/// `chave = "<kind>:<id>:<YYYY-MM-DD>"`, com o dia no fuso do time: a mesma
+/// condição no dia seguinte gera outra chave, então a tarefa volta sozinha se
+/// ainda valer. Por usuário: um vendedor não esconde a tarefa do outro. A
+/// retenção (core/retencao) apaga o que tem mais de 30 dias.
+model DailyTaskState {
+  id      String   @id @default(uuid())
+  teamId  String
+  userId  String
+  chave   String
+  feitoEm DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId, chave])
+  @@index([feitoEm])
+}
+
+/// Convidado de um compromisso (decisão 8, 28/09): vários por compromisso —
+/// contato, colega do time ou e-mail avulso. Substitui o antigo
+/// `Appointment.convidadoEmail` (a migration copiou o valor para cá).
+model AppointmentAttendee {
+  id            String   @id @default(uuid())
+  teamId        String
+  appointmentId String
+  // Sempre em minúsculas e sem espaços: é a chave do convite e do Google.
+  email         String
+  nome          String?
+  // Colega do time convidado (vê o compromisso na Agenda dele).
+  userId        String?
+  // Contato do CRM Agro com este e-mail (casado pelo ChannelIdentifier).
+  contactId     String?
+  // Resposta ao convite vinda do Google: needsAction | accepted | declined | tentative.
+  resposta      String   @default("needsAction")
+  createdAt     DateTime @default(now())
+
+  team        Team        @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  user        User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  contact     Contact?    @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@unique([appointmentId, email])
+  @@index([teamId, email])
+  @@index([userId])
+  @@index([contactId])
+}
+
+enum OAuthProvider {
+  google
+}
+
+enum OAuthConnectionStatus {
+  // Tokens válidos: sincroniza.
+  connected
+  // O Google recusou o refresh token (invalid_grant: revogado lá, 6 meses sem
+  // uso, 7 dias no modo de teste): a pessoa precisa reconectar. Sem laço.
+  reauth_required
+  // Falha persistente que não é de autorização (ex.: API desligada no projeto).
+  error
+}
+
+/// Conexão OAuth de UMA pessoa com a conta externa dela (decisão 3: cada um
+/// conecta a PRÓPRIA agenda, sem o administrador). Fase 1: Google Agenda.
+/// Os tokens ficam cifrados (`encryptCredentials`, com o anel de rotação) e
+/// nunca saem do servidor. Desconectar, desativar ou excluir a pessoa revoga o
+/// token no Google e APAGA a linha (decisão 7): nada é transferido.
+model OAuthConnection {
+  id                  String                @id @default(uuid())
+  teamId              String
+  userId              String
+  provider            OAuthProvider
+  // Google: `sub` do id_token (estável; o e-mail pode mudar).
+  externalAccountId   String
+  // E-mail da conta Google conectada (exibição).
+  email               String
+  // Escopos CONCEDIDOS (a tela de consentimento deixa desmarcar).
+  scopes              String[]
+  // Cifrado: { refreshToken, accessToken }.
+  credentials         Json
+  accessTokenExpiraEm DateTime?
+  status              OAuthConnectionStatus @default(connected)
+  falhas              Int                   @default(0)
+  // Mensagem curta, sem token nem corpo de resposta.
+  ultimoErro          String?
+  ultimoErroEm        DateTime?
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+
+  team        Team                @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  calendarios CalendarSync[]
+  vinculos    AppointmentLink[]
+  ocupados    CalendarBusyBlock[]
+
+  // A mesma conta Google não fica em duas pessoas (a agenda se dividiria).
+  @@unique([provider, externalAccountId])
+  // Uma conta por provedor por pessoa.
+  @@unique([userId, provider])
+  @@index([teamId, userId])
+  @@index([status])
+}
+
+/// Revogação no Google que falhou (rede ou Google fora) ao desconectar,
+/// desativar ou excluir a pessoa. A conexão já foi apagada; só o token
+/// (cifrado) fica aqui até o Google confirmar a revogação, com tentativas
+/// limitadas pelo worker — depois disso a linha sai de qualquer jeito.
+model OAuthRevogacaoPendente {
+  id          String        @id @default(uuid())
+  teamId      String
+  provider    OAuthProvider
+  // Cifrado: { token }.
+  credentials Json
+  tentativas  Int           @default(0)
+  proximaEm   DateTime      @default(now())
+  ultimoErro  String?
+  createdAt   DateTime      @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([proximaEm])
+}
+
+/// Sincronização de UMA agenda de uma conexão (fase 1: só a "primary"):
+/// cursor da incremental (`syncToken`) e canal de push (`events.watch`). O
+/// token do canal não é guardado: é um HMAC do id do canal com o AUTH_SECRET.
+model CalendarSync {
+  id                     String    @id @default(uuid())
+  teamId                 String
+  connectionId           String
+  calendarId             String    @default("primary")
+  syncToken              String?
+  // Fuso da agenda no Google (vem na resposta do events.list).
+  fusoHorario            String?
+  canalId                String?   @unique
+  canalResourceId        String?
+  canalExpiraEm          DateTime?
+  // Espera depois de uma falha no `watch` (sem virar polling de 1 minuto).
+  canalTentarEm          DateTime?
+  // Até onde a última sincronização completa enxergou (agora + 180 dias): perto
+  // do fim, uma completa nova traz o que entrou na janela com o tempo.
+  janelaAte              DateTime?
+  ultimaSincronizacaoEm  DateTime?
+  // Próxima rodada do polling de reserva (com sorteio de ±25%) ou do backoff.
+  proximaSincronizacaoEm DateTime?
+  falhas                 Int       @default(0)
+  ultimoErro             String?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  team       Team            @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  connection OAuthConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, calendarId])
+  @@index([proximaSincronizacaoEm])
+  @@index([canalExpiraEm])
+}
+
+/// Vínculo compromisso ↔ evento do Google (identidade estável: não duplica).
+/// Evento criado pelo CRM Agro usa o id do compromisso sem hífens como id no
+/// Google e leva `crmagroId` numa propriedade privada.
+model AppointmentLink {
+  id                  String    @id @default(uuid())
+  teamId              String
+  appointmentId       String
+  connectionId        String
+  calendarId          String    @default("primary")
+  externalEventId     String
+  iCalUID             String?
+  etag                String?
+  // `updated` do evento no Google na última sincronização.
+  externalUpdatedAt   DateTime?
+  // "crmagro" (criado aqui) | "google" (veio da agenda da pessoa).
+  origem              String    @default("crmagro")
+  // Alteração do CRM Agro ainda não enviada ao Google (o worker tenta de novo).
+  pendenteDesde       DateTime?
+  tentativas          Int       @default(0)
+  ultimoErro          String?
+  sincronizadoEm      DateTime?
+  // Impressão digital dos campos comuns do último envio/recebimento: resposta
+  // de convidado e Meet mudam o `updated` do Google mas não isto (decisão 5).
+  camposHash          String?
+  // O cancelamento veio do Google (só esse é desfeito por uma mudança de lá).
+  canceladoNoGoogleEm DateTime?
+  // Vínculo APOSENTADO na troca de responsável: o evento na agenda do antigo
+  // organizador ainda precisa ser cancelado lá (`cancelarAvisando` = com
+  // sendUpdates=all, porque os convidados foram convidados por ele). Fica
+  // pendente — o worker tenta de novo; com a conta em "Reconectar", espera — e
+  // só sai depois do 2xx/404/410. Nunca é destino de escrita nem de leitura.
+  cancelarEm          DateTime?
+  cancelarAvisando    Boolean   @default(false)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  team        Team            @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  appointment Appointment     @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  connection  OAuthConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, calendarId, externalEventId])
+  @@unique([appointmentId, connectionId])
+  // UM compromisso por evento no time: dois colegas convidados para o mesmo
+  // evento, sincronizando juntos, não duplicam (o id do evento é o mesmo nas
+  // agendas de todos; o do CRM Agro leva o sufixo da conexão).
+  @@unique([teamId, externalEventId])
+  @@index([pendenteDesde])
+}
+
+/// Bloco "Ocupado" da agenda pessoal (decisão 4): SÓ início, fim e o id do
+/// evento no Google. Nunca título, descrição, local nem convidados, nem para
+/// o próprio dono: o gestor nunca vê a vida pessoal de ninguém.
+model CalendarBusyBlock {
+  id              String   @id @default(uuid())
+  teamId          String
+  userId          String
+  connectionId    String
+  externalEventId String
+  inicio          DateTime
+  fim             DateTime
+  // Título do evento: só a DONA do bloco vê (colegas e gestor veem "Ocupado").
+  titulo          String?
+  // A pessoa tirou este evento do CRM ("Tirar do CRM Agro"): fica só "Ocupado" e
+  // a sincronização não o importa de novo.
+  naoImportar     Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  team       Team            @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connection OAuthConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, externalEventId])
+  @@index([teamId, userId, inicio])
+}
+
+enum AppointmentType {
+  reuniao
+  ligacao
+  follow_up
+  tarefa
+  outro
+  visita
+  // Reunião online (Google Meet criado junto com o evento no Google Agenda).
+  reuniao_online
+}
+
+enum AppointmentStatus {
+  pendente
+  concluido
+  cancelado
+}
+
+enum CallDirection {
+  outbound
+  inbound
+}
+
+enum CallStatus {
+  scheduled
+  ringing
+  answered
+  no_answer
+  busy
+  failed
+  completed
+}
+
+// Resultado da ligação marcado pelo vendedor (produto §D) ou pela Voopi. É o
+// "como terminou" — o `status` é o ciclo de vida. `voicemail` agenda o retorno;
+// `wrong_number` invalida o número do contato.
+enum CallOutcome {
+  answered
+  no_answer
+  busy
+  voicemail
+  wrong_number
+  skip
+}
+
+// ---------------------------------------------------------------------------
+// Tenant raiz
+// ---------------------------------------------------------------------------
+
+model Team {
+  id        String   @id @default(uuid())
+  name      String
+  // Dados da empresa (Configurações → Empresa), todos opcionais.
+  cnpj      String?
+  cidade    String?
+  estado    String?
+  // Master do time (pedido do dono, 28/09): UM só por time — quem criou a
+  // empresa. É o único com papel "owner"; os demais são administrador, membro
+  // ou só leitura, e só o master muda o papel deles. Nulo = time antigo com
+  // mais de um "owner" e sem master definido (o backfill não inventa master):
+  // `script de operação` define pelo e-mail.
+  masterId  String?  @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  master               User?                    @relation("TeamMaster", fields: [masterId], references: [id], onDelete: SetNull)
+  users                User[]                   @relation("TeamUsers")
+  goals                Goal[]
+  contacts             Contact[]
+  funnels              Funnel[]
+  flows                Flow[]
+  integrations         Integration[]
+  activities           Activity[]
+  conversations        Conversation[]
+  messages             Message[]
+  stages               Stage[]
+  deals                Deal[]
+  flowNodes            FlowNode[]
+  enrollments          Enrollment[]
+  flowVersions         FlowVersion[]
+  flowStepExecutions   FlowStepExecution[]
+  identifiers          ChannelIdentifier[]
+  channelAccounts      ChannelAccount[]
+  calls                Call[]
+  teamConfig           TeamConfig?
+  tags                 Tag[]
+  contactTags          ContactTag[]
+  channelAccountUsage  ChannelAccountUsage[]
+  companies            Company[]
+  contactCompanies     ContactCompany[]
+  enrichmentFacts      EnrichmentFact[]
+  appointments         Appointment[]
+  prospectDrafts       ProspectDraft[]
+  emailSignatures      EmailSignature[]
+  aiConversations      AiConversation[]
+  relayAgentTokens     RelayAgentToken[]
+  invites              Invite[]
+  importJobs           ImportJob[]
+  campaigns            Campaign[]
+  campaignRecipients   CampaignRecipient[]
+  pushSubscriptions    PushSubscription[]
+  dailyTaskStates      DailyTaskState[]
+  mapaCamadas          MapaCamada[]
+  appointmentAttendees AppointmentAttendee[]
+  oauthConnections     OAuthConnection[]
+  calendarSyncs        CalendarSync[]
+  appointmentLinks     AppointmentLink[]
+  calendarBusyBlocks   CalendarBusyBlock[]
+  revogacoesPendentes  OAuthRevogacaoPendente[]
+  whatsappLids         WhatsAppLid[]
+  emailEncaminhamentos EmailEncaminhamento[]
+  knowledgeDocs        KnowledgeDoc[]
+  methodologies        Methodology[]
+  consultasDocumento   ConsultaDocumento[]
+  linhasDeLigacao      LinhaDeLigacao[]
+  // Os modelos prontos de metodologia (SPIN Selling e outros) já foram criados para este time.
+  metodologiasIniciadas Boolean @default(false)
+}
+
+// ---------------------------------------------------------------------------
+// TeamConfig — preferências (1:1 com Team). Hoje: horário comercial e feriados
+// configuráveis do "motor do dia"/discador. Nasce opcional (a row só é criada
+// quando o time salva uma config não-default); ausência = defaults em runtime.
+// ---------------------------------------------------------------------------
+
+model TeamConfig {
+  id                   String   @id @default(uuid())
+  teamId               String   @unique
+  respectBusinessHours Boolean  @default(false)
+  businessHourStart    String   @default("08:00")
+  businessHourEnd      String   @default("18:00")
+  businessDays         String   @default("mon,tue,wed,thu,fri")
+  respectHolidays      Boolean  @default(true)
+  timezone             String   @default("America/Sao_Paulo")
+  // Governança da IA (Fase 6): "off" (desligada) | "read_only" (só analisa/sugere)
+  // | "read_write" (pode escrever no banco — sempre atribuído a autor=IA, tags "IA:").
+  aiMode               String   @default("off")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+}
+
+// ---------------------------------------------------------------------------
+// Usuários / metas
+// ---------------------------------------------------------------------------
+
+model User {
+  id                String    @id @default(uuid())
+  teamId            String
+  name              String
+  email             String    @unique
+  // Papel (RBAC). Enum como String: owner|admin|member|viewer. Hierarquia
+  // owner>admin>member>viewer. "owner" = o MASTER do time (`Team.masterId`),
+  // gravado sempre de forma explícita (criar empresa, Google, script). O padrão
+  // era "owner" (backfill do RBAC) e fez nascer vários "owner" no mesmo time
+  // por script/seed; desde a regra do master único o padrão é o MENOR acesso.
+  role              String    @default("member")
+  // bcrypt. Null = usuário ainda sem senha definida (não consegue entrar).
+  passwordHash      String?
+  lastLoginAt       DateTime?
+  // Versão da sessão (auditoria S12). Incrementa em troca de senha, de papel e
+  // na remoção: o JWT carrega a versão do login e o callback `jwt` (auth.ts)
+  // derruba a sessão quando ela diverge do banco (revalida a cada ~60 s).
+  sessionVersion    Int       @default(1)
+  // Quando o e-mail foi comprovado — SÓ pelo login Google (convite e
+  // redefinição saem pelo SMTP do time e não provam nada; auditoria do #148).
+  // Null = conta por senha ainda não comprovada: se o dono real do e-mail
+  // entrar pelo Google, a senha de quem criou é apagada (proteção contra conta
+  // "sequestrada de antemão"). Quem já existia na migration conta comprovado.
+  emailVerificadoEm DateTime?
+  // Equipe (plano-equipe-permissoes F2). `verTudoEm`: telas em que a pessoa
+  // vê os registros de TODOS do time, não só os dela (ex.: Contatos de todos,
+  // Conversas só as dela) — liberado pelo administrador; vazio = só os meus em
+  // todas. Valores: `MODULOS_COM_DONO` (core/auth/modulos.ts).
+  // `editarTudoEm`: telas em que, além de ver, ALTERA os registros de todos
+  // ("Ver e editar de todos"); sempre dentro de `verTudoEm`. Vazio = altera só
+  // os seus (e os compartilhados).
+  // `verTudo`: OBSOLETO (o "ver tudo" de antes, tudo ou nada). Convertido para
+  // `verTudoEm` na migration e sem uso no código; fica uma versão para o app
+  // antigo não quebrar durante o deploy. Remover na próxima migration.
+  // `desativadoEm`: sem acesso (login recusado, sessões derrubadas), nada
+  // apagado. `permissoesEquipe`: para administradores, o que o master liberou
+  // fazer com a equipe ("convidar", "desativar", "excluir"); o master pode
+  // tudo. `modulos`: telas liberadas (vazio = padrão do papel) — F2b.
+  verTudo           Boolean   @default(false)
+  verTudoEm         String[]  @default([])
+  editarTudoEm      String[]  @default([])
+  desativadoEm      DateTime?
+  permissoesEquipe  String[]  @default([])
+  modulos           String[]  @default([])
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  team                    Team                  @relation("TeamUsers", fields: [teamId], references: [id], onDelete: Cascade)
+  masterDoTime            Team?                 @relation("TeamMaster")
+  ownedGoals              Goal[]                @relation("GoalOwner")
+  ownedContacts           Contact[]             @relation("ContactOwner")
+  relayAgentTokens        RelayAgentToken[]
+  passwordResetTokens     PasswordResetToken[]
+  invitesSent             Invite[]              @relation("InviteAuthor")
+  pushSubscriptions       PushSubscription[]
+  dailyTaskStates         DailyTaskState[]
+  appointmentsResponsavel Appointment[]         @relation("AppointmentResponsavel")
+  aiConversations         AiConversation[]
+  convitesAgenda          AppointmentAttendee[]
+  oauthConnections        OAuthConnection[]
+  calendarBusyBlocks      CalendarBusyBlock[]
+  linhasDeLigacao         LinhaDeLigacao[]
+
+  @@index([teamId])
+}
+
+// Web Push (avisos no navegador/celular). Uma linha por navegador do usuário:
+// `endpoint` é a URL do serviço de push (FCM, Mozilla, Apple) e identifica o
+// navegador — único no sistema todo (outro login no mesmo navegador assume a
+// assinatura). `p256dh`/`auth` cifram o conteúdo (RFC 8291). 404/410 do
+// serviço = assinatura morta, apagada no envio (core/push/service.ts).
+model PushSubscription {
+  id         String    @id @default(uuid())
+  teamId     String
+  userId     String
+  endpoint   String    @unique
+  p256dh     String
+  auth       String
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  ultimoOkEm DateTime?
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([teamId, userId])
+}
+
+model Goal {
+  id           String   @id @default(uuid())
+  teamId       String
+  ownerId      String?
+  periodo      String // ex.: "2026-07"
+  metaValor    Decimal  @db.Decimal(12, 2)
+  toquesPorDia Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  team  Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  owner User? @relation("GoalOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  @@index([teamId])
+}
+
+// ---------------------------------------------------------------------------
+// Contact — a espinha dorsal
+// ---------------------------------------------------------------------------
+
+model Contact {
+  id                   String               @id @default(uuid())
+  teamId               String
+  nome                 String
+  sobrenome            String? // enriquecimento (nome + sobrenome quando a IA acha)
+  relacionamentoStatus RelacionamentoStatus @default(novo)
+  interesse            Interesse            @default(nao_avaliado)
+  cidade               String?
+  estado               String? // UF (ex.: "MT")
+  endereco             String? // endereço da PESSOA (contato)
+  empresa              String? // legado (nome da empresa principal) — ver model Company
+  cargo                String? // profissão/cargo da PESSOA
+  // Segmentação comercial (produto §B): camadas do mapa e filtros por porte.
+  areaHa               Float? // área da propriedade em hectares
+  faturamentoAnual     Float? // faturamento anual estimado em R$ (segmentação, não contabilidade)
+  camadaId             String? // camada do mapa (null = "Sem camada")
+  cpfCifrado           String? // CPF cifrado (AES-256-GCM, formato "crmagro.enc.v2..."). Ler e gravar só por contacts/cpf.ts
+  cpfHash              String? // impressão do CPF (HMAC por time) para achar "o mesmo CPF" sem abrir o cifrado. Só por contacts/cpf.ts
+  cnpj                 String? // legado — dados de empresa migram para Company
+  site                 String? // legado
+  origem               String?
+  enrichment           Json? // achados extras da pesquisa (resumo, fontes, etc.)
+  // Classificação de PRODUTOR RURAL (colunas dedicadas = filtro indexável). O
+  // score/evidências vêm do classificador versionado (produtor/classify.ts) via
+  // pipeline de enriquecimento. produtorLabel: produtor | provavel_produtor |
+  // nao_produtor
+  isProdutor           Boolean?
+  produtorScore        Int?
+  produtorLabel        String?
+  produtorRegraVersao  String?
+  // Verificador do AGRO (botão "Verificar agro" em Contatos): o que o contato É no agro, lendo o nome, as empresas
+  // vinculadas (CNAE e sócios) e a foto do WhatsApp. `agroTipos`: produtor | fazenda | armazem | algodoeira (vários
+  // ou nenhum). Separado de `produtorLabel`, que tem uma palavra só e vem do CNAE da empresa: "produtor" aqui exige
+  // que o nome do contato bata com um sócio da empresa. `agroDetalhe` (Json, formato em core/agro/schema.ts): origem
+  // (automática ou ajuste à mão, que a verificação não sobrescreve), data, evidências e a foto (na fila para o
+  // Claude, lida ou sem foto; nunca a imagem, o telefone nem o link dela). Docs: a documentação interna.
+  agroTipos            String[]             @default([])
+  agroDetalhe          Json?
+  tags                 String[]
+  // Mapa (produto §B.1). Coordenada do contato: do endereço dele, do centroide
+  // da cidade ou herdada da empresa principal. É dado pessoal (fica no
+  // registro do contato e some com ele). `geoHash` = sha1 do endereço
+  // normalizado que gerou a coordenada: mudou o endereço, regeocodifica;
+  // null = nunca processado (o backfill pega).
+  latitude             Float?
+  longitude            Float?
+  geoPrecisao          String? // "endereco" | "cidade" | "manual" | "nenhuma"
+  geoFonte             String? // "nominatim" | "ibge" | "empresa" | "manual"
+  geoHash              String?
+  geoAtualizadoEm      DateTime?
+  culturas             String[] // soja, milho, algodão… (hoje só existe como tag)
+  // RESPONSÁVEL pelo contato (regra do dono, 28/09): obrigatório no APP
+  // (`responsavelObrigatorio` no core; sem pessoa → o master). Fica opcional no
+  // banco por causa do `onDelete: SetNull` e das fixtures de teste.
+  ownerId              String?
+  // Escopo por dono (plano-equipe-permissoes F3): "compartilhado" = o time todo vê
+  // (F4); senão só o dono (ownerId), o master/admin e quem tem "ver tudo".
+  compartilhado        Boolean              @default(false)
+  // Texto de busca normalizado (sem acento, minúsculas; CNPJ só em dígitos). Mantido por TRIGGER no banco
+  // (crmagro_busca_contato, migration 20261009100000) a cada escrita; o app nunca lê nem grava (`@ignore`).
+  // Não tem e-mail, telefone nem CPF. Docs: a documentação interna.
+  buscaTexto           String?              @ignore
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  team               Team                  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  owner              User?                 @relation("ContactOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  activities         Activity[]
+  conversations      Conversation[]
+  deals              Deal[]
+  enrollments        Enrollment[]
+  identifiers        ChannelIdentifier[]
+  calls              Call[]
+  contactTags        ContactTag[]
+  companies          ContactCompany[]
+  camada             MapaCamada?           @relation(fields: [camadaId], references: [id], onDelete: SetNull)
+  appointments       Appointment[]
+  convitesAgenda     AppointmentAttendee[]
+  campaignRecipients CampaignRecipient[]
+
+  @@index([teamId])
+  // Item 2.1 (DP-09/DP-13): lista paginada (mais novos primeiro) e filtros.
+  @@index([teamId, relacionamentoStatus, createdAt(sort: Desc)])
+  @@index([teamId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([teamId, cnpj])
+  @@index([teamId, cpfHash])
+  // Busca "contém" (ILIKE '%x%') por trigram — sem isto, varre a tabela.
+  @@index([nome(ops: raw("gin_trgm_ops"))], type: Gin, map: "Contact_nome_trgm_idx")
+  @@index([empresa(ops: raw("gin_trgm_ops"))], type: Gin, map: "Contact_empresa_trgm_idx")
+  @@index([teamId, interesse])
+  @@index([teamId, produtorLabel]) // filtro "ver só produtores"
+  @@index([teamId, camadaId]) // camadas do mapa
+  @@index([teamId, areaHa]) // filtro por porte
+  // Mapa: pontos de um retângulo (bbox) do time.
+  @@index([teamId, latitude, longitude])
+  // Backfill da geocodificação: "geoHash IS NULL" (nunca processado).
+  @@index([geoHash])
+  @@index([teamId, ownerId]) // escopo por dono (F3)
+}
+
+// Empresa — o contato (PESSOA) pode ser dono/sócio de UMA OU MAIS empresas
+// (ContactCompany). Dados da empresa vivem aqui, separados da pessoa.
+model Company {
+  id               String    @id @default(uuid())
+  teamId           String
+  nome             String
+  cnpj             String?
+  ie               String? // inscrição estadual (Sintegra)
+  site             String?
+  email            String?
+  telefone         String?
+  endereco         String?
+  cidade           String?
+  estado           String?
+  instagram        String?
+  linkedin         String?
+  naturezaJuridica String? // ex.: "Empresário Individual"
+  // CNAE principal (código) + secundários + tipos de IE — antes descartados no
+  // fetch; colunas dedicadas alimentam o classificador de produtor.
+  cnae             String? // código do CNAE principal
+  cnaesSecundarios String[] // códigos dos CNAEs secundários
+  iesTipos         Json? // [{ numero, tipo, uf, habilitada }]
+  enrichment       Json?
+  // Mapa (produto §B.1): mesma coordenada do Contact. O contato sem endereço
+  // próprio herda a da empresa principal.
+  latitude         Float?
+  longitude        Float?
+  geoPrecisao      String? // "endereco" | "cidade" | "manual" | "nenhuma"
+  geoFonte         String? // "nominatim" | "ibge" | "manual"
+  geoHash          String?
+  geoAtualizadoEm  DateTime?
+  // Texto de busca normalizado da empresa (colunas da ficha + razão social, atividade e sócios do enriquecimento).
+  // Mantido por TRIGGER (crmagro_busca_empresa); o app não lê nem grava. Ver Contact.buscaTexto.
+  buscaTexto       String?   @ignore
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  team     Team             @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contatos ContactCompany[]
+
+  @@index([teamId])
+  @@index([teamId, cnpj])
+}
+
+// ---------------------------------------------------------------------------
+// EnrichmentFact — proveniência APPEND-ONLY do pipeline de enriquecimento. Cada
+// resultado de um Enricher vira um registro imutável (nunca se perde quem/quando/
+// qual regra produziu um valor). A coluna dedicada (ex.: Contact.produtorLabel) é
+// o "vencedor promovido"; o Fact é o histórico versionado para máquina (não
+// substitui a Activity, que é a timeline humana). Ver §4 do doc de arquitetura.
+// ---------------------------------------------------------------------------
+model EnrichmentFact {
+  id              String    @id @default(uuid())
+  teamId          String
+  targetType      String // "contact" | "company"
+  targetId        String
+  field           String // ex.: "produtorLabel", "cnae", "ie"
+  value           Json // valor produzido (qualquer shape)
+  enricherKey     String // ex.: "cnpj", "produtor"
+  enricherVersion String // ex.: "produtor@2026-08-11"
+  source          String // ex.: "cnpja", "brasilapi", "regra", "ai"
+  confidence      Float     @default(0.5) // 0–1; humano = 1
+  evidences       Json? // URLs/trechos/justificativa
+  producedAt      DateTime  @default(now())
+  appliedAt       DateTime? // quando foi promovido à coluna dedicada (null = só histórico)
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([teamId])
+  @@index([teamId, targetType, targetId])
+  @@index([teamId, enricherKey])
+}
+
+// Vínculo pessoa↔empresa com o PAPEL (dono/sócio/funcionário).
+model ContactCompany {
+  id        String   @id @default(uuid())
+  teamId    String
+  contactId String
+  companyId String
+  papel     String   @default("socio") // dono | socio | funcionario | outro
+  createdAt DateTime @default(now())
+
+  team    Team    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([contactId, companyId])
+  @@index([teamId])
+  @@index([companyId])
+}
+
+// ---------------------------------------------------------------------------
+// Tag / ContactTag — tags nomeáveis e contáveis (§12 "adiados", agora ativado).
+// A tabela `Contact.tags String[]` (legado) continua para compat; a fonte de
+// verdade de tags nomeáveis/filtráveis é ContactTag. O limite de "1 tag por
+// contato (por enquanto)" é imposto na CAMADA DE SERVIÇO — o join suporta N,
+// deixando o caminho aberto para multi-tag sem migration. Só o unique
+// [contactId, tagId] (evita duplicar a MESMA tag) vive no banco.
+// ---------------------------------------------------------------------------
+
+model Tag {
+  id        String   @id @default(uuid())
+  teamId    String
+  nome      String
+  cor       String? // token de cor da UI (ex.: "brand", "amber") ou hex
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team        Team         @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contactTags ContactTag[]
+
+  @@unique([teamId, nome])
+  @@index([teamId])
+}
+
+model ContactTag {
+  id        String   @id @default(uuid())
+  teamId    String
+  contactId String
+  tagId     String
+  createdAt DateTime @default(now())
+
+  team    Team    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  tag     Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([contactId, tagId])
+  @@index([teamId])
+  @@index([contactId])
+  @@index([tagId])
+}
+
+// ---------------------------------------------------------------------------
+// Identifiers multicanal — um contato pode ter vários (whatsapp, email,
+// instagram, linkedin...). A "espinha" é o Contact; cada canal de prospecção
+// aponta pra um identifier (número, @handle, email). O motor de fluxos e o
+// envio por canal consultam esta tabela pra saber por onde alcançar o contato.
+// ---------------------------------------------------------------------------
+
+model ChannelIdentifier {
+  id             String   @id @default(uuid())
+  teamId         String
+  contactId      String
+  canal          Canal
+  valor          String // E.164 (whatsapp), lowercased email, @handle (ig/linkedin)
+  isPrimary      Boolean  @default(false)
+  // Endereço que não existe (item 3.4): bounce PERMANENTE (DSN 5.x.x ou
+  // X-Failed-Recipients) marca; o `send_email` pula em vez de mandar de novo
+  // (reputação do domínio). Trocar o valor ou receber e-mail dele desmarca.
+  invalido       Boolean  @default(false)
+  invalidoMotivo String?
+  // Cifra em repouso de e-mail e telefone. Só canais
+  // whatsapp e email; instagram e linkedin são handles públicos e ficam só em `valor`. Todas anuláveis:
+  // com a flag `off` nunca são preenchidas.
+  //  - valorCifrado: AES-256-GCM (`crmagro.enc.v2....`), para mostrar e enviar;
+  //  - valorHash: índice cego (HMAC por time) do valor canônico, para achar por igualdade exata;
+  //  - valorSufixoHash: índice cego dos 8 últimos dígitos (só whatsapp), une as variantes do 9º dígito.
+  valorCifrado    String?
+  valorHash       String?
+  valorSufixoHash String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  team    Team    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, canal, valor])
+  // Mesmo unique pelo índice cego (NULL é sempre distinto: linhas sem índice não colidem).
+  @@unique([teamId, canal, valorHash])
+  // + índice PARCIAL só no SQL (o Prisma não expressa `WHERE`):
+  //   "ChannelIdentifier_teamId_valorSufixoHash_idx" (teamId, valorSufixoHash) WHERE valorSufixoHash IS NOT NULL
+  @@index([teamId, canal])
+  @@index([contactId])
+  // Busca "contém" por telefone/e-mail/@ (trigram).
+  @@index([valor(ops: raw("gin_trgm_ops"))], type: Gin, map: "ChannelIdentifier_valor_trgm_idx")
+}
+
+model Activity {
+  id        String       @id @default(uuid())
+  teamId    String
+  contactId String
+  tipo      ActivityTipo
+  direcao   Direcao?
+  conteudo  String?
+  // Mídia da atividade (áudio/imagem/doc) — caminho no bucket privado; a URL é
+  // assinada na leitura. Preenchido quando a atividade nasce de uma Message de
+  // mídia, pra tocar/exibir direto no histórico do contato.
+  mediaPath String?
+  mediaMime String?
+  // Negócio (card do funil) desta atividade — o "feedback" do card. Nullable:
+  // mensagens/notas soltas ficam só no contato. Scalar (sem relação) p/ não
+  // cascatear: apagar o negócio não apaga o histórico do contato.
+  dealId    String?
+  meta      Json? // stage_change registra { de, para }
+  // Escopo por dono (plano-equipe-permissoes F3): quem registrou (null = sistema/motor).
+  // A visibilidade segue a do contato.
+  userId    String?
+  createdAt DateTime     @default(now())
+
+  team    Team    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([teamId])
+  @@index([contactId])
+  // Activity é a tabela de maior volume (toda mensagem, mudança de etapa e passo
+  // de fluxo grava uma). O Painel filtra por tipo+createdAt a cada carregamento
+  // (kpis, atividadeSemana) e as métricas de envio/resposta vão pelo mesmo caminho.
+  @@index([dealId])
+  @@index([teamId, tipo, createdAt])
+  // Item 2.1 (DP-08): toques de saída/entrada por período e linha do tempo.
+  @@index([teamId, tipo, direcao, createdAt])
+  @@index([contactId, createdAt])
+  // "respondeu?" do motor: Activity de entrada de um contato após lastOutboundAt.
+  @@index([contactId, direcao, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Conversas / Mensagens (inbox)
+// ---------------------------------------------------------------------------
+
+model Conversation {
+  id                 String             @id @default(uuid())
+  teamId             String
+  contactId          String? // nullable: inbound de número não-cadastrado não cria Contact
+  canal              Canal
+  channelAccountId   String? // conta conectada que origina/recebe a conversa (nullable: rows pré-migration)
+  externalNumber     String? // remetente (E.164) quando não há Contact vinculado
+  // Cifra em repouso (CONTATOS_CIFRA): telefone cifrado (o @lid fica só em claro, é código anônimo) e o
+  // índice cego do número (telefone ou @lid) para achar por igualdade exata.
+  externalNumberCifrado String?
+  externalNumberHash    String?
+  // pushName do perfil da OUTRA pessoa — vem SÓ de mensagem RECEBIDA (fromMe=false).
+  // Na mensagem enviada o pushName é o do próprio dono da conta (bug de 28/09).
+  externalName       String?
+  // Nome que o dono da conta SALVOU NA AGENDA do celular (contatos da instância
+  // na Evolution, `POST /chat/findContacts`). Separado do pushName para manter a
+  // ordem do nome exibido: contato cadastrado > agenda > pushName > número.
+  nomeAgenda         String?
+  status             ConversationStatus @default(open)
+  unreadCount        Int                @default(0)
+  lastMessageAt      DateTime?
+  // Resumo da ÚLTIMA mensagem (item 2.2, DP-01): gravado junto do lastMessageAt
+  // em `touchConversation`. A lista do inbox lê daqui em vez de buscar a última
+  // Message de cada conversa (que puxava todas as mensagens da conta).
+  lastMessagePreview String? // texto cortado (200) ou "[image]"/"[audio]"/"[doc]"
+  lastMessageDirecao Direcao?
+  lastMessageSubject String? // e-mail: assunto (a prévia do e-mail é o assunto)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  team           Team            @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contact        Contact?        @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  channelAccount ChannelAccount? @relation(fields: [channelAccountId], references: [id], onDelete: SetNull)
+  messages       Message[]
+  // + ÍNDICES ÚNICOS PARCIAIS só no SQL (o Prisma não expressa `WHERE`), item 0.8:
+  //   "Conversation_account_contact_uq"  (channelAccountId, contactId)      WHERE contactId IS NOT NULL
+  //   "Conversation_account_external_uq" (channelAccountId, externalNumber) WHERE contactId IS NULL
+  //   "Conversation_account_external_hash_uq" (channelAccountId, externalNumberHash) WHERE contactId IS NULL AND externalNumberHash IS NOT NULL
+  // Um contato (ou número não cadastrado) tem UMA conversa por conta. Violou →
+  // P2002: getOrCreateConversation relê a vencedora; vincularConversaAoContato mescla.
+
+  @@index([teamId])
+  @@index([contactId])
+  @@index([channelAccountId])
+  @@index([teamId, channelAccountId, externalNumber])
+  // Item 2.1 (DP-23): achar a conversa pelo número sem saber a conta.
+  @@index([teamId, externalNumber])
+  // Os mesmos dois, pelo índice cego (CONTATOS_CIFRA).
+  @@index([teamId, channelAccountId, externalNumberHash])
+  @@index([teamId, externalNumberHash])
+  // listConversations ordena por lastMessageAt dentro de uma conta.
+  @@index([channelAccountId, lastMessageAt])
+}
+
+// ---------------------------------------------------------------------------
+// WhatsAppLid — mapa "código anônimo do WhatsApp (@lid) → telefone" (30/09/2026).
+// O WhatsApp identifica cada vez mais as conversas por um código anônimo
+// (`184469901234567@lid`) em vez do telefone. A Evolution grava as duas formas
+// da MESMA pessoa (`remoteJid` = @lid, `remoteJidAlt` = telefone) e o CRM Agro
+// nunca guardava o par: o histórico antigo (só @lid) e as mensagens novas
+// (telefone) viravam duas conversas. Com o par guardado, o CRM Agro junta as duas
+// (conversations/unificar-lid.ts) e o importador do histórico já grava as
+// mensagens antigas na conversa certa.
+//
+// Vale para o TIME (o @lid é da pessoa no WhatsApp, igual em todas as contas do
+// time). `telefone` é E.164 (mesma forma do `ChannelIdentifier.valor`). Uma
+// linha por @lid: o par mais novo vence (o @lid segue a conta do WhatsApp; o
+// telefone pode trocar de dono).
+// ---------------------------------------------------------------------------
+
+model WhatsAppLid {
+  id        String   @id @default(uuid())
+  teamId    String
+  lid       String // "184469901234567@lid" (igual ao remoteJid da Evolution)
+  telefone  String // E.164 canônico (+5566999998888)
+  // Cifra em repouso (CONTATOS_CIFRA): telefone cifrado e índice cego dele.
+  telefoneCifrado String?
+  telefoneHash    String?
+  // Como o par foi descoberto: "webhook" (a mensagem trouxe os dois), "evolution"
+  // (consulta de leitura ao banco da Evolution), "historico" (importação) ou
+  // "manual" (a pessoa unificou pela tela).
+  origem    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, lid])
+  @@index([teamId, telefone])
+  @@index([teamId, telefoneHash])
+}
+
+model Message {
+  id                String        @id @default(uuid())
+  teamId            String
+  conversationId    String
+  direcao           Direcao
+  tipo              MessageType
+  conteudo          String? // texto ou legenda da mídia
+  // Mídia (image/audio/doc): caminho do objeto no bucket privado do Supabase
+  // Storage. A URL de exibição é ASSINADA na leitura (nunca persiste URL, que
+  // expira). mediaMime guarda o content-type original p/ render correto.
+  mediaPath         String?
+  mediaMime         String?
+  providerMessageId String?
+  status            MessageStatus @default(sent)
+  // Código de erro devolvido pelo servidor do WhatsApp no ack (ex.: "463" =
+  // trava de alcance a frio). Chega pelo evento MESSAGES_UPDATE. É a única
+  // fonte real de saúde do número — sem isso a mensagem só fica em "sent".
+  errorCode         String?
+  statusAt          DateTime? // quando o último status chegou
+  // E-mail (item 3.4): primeira abertura que conta pelo pixel — sem os hits de
+  // scanner e os de menos de 60 s. `openSource`: "cliente" | "proxy_google" |
+  // "proxy_yahoo" (proxy = abertura provável: o proxy busca a imagem por ele).
+  openedAt          DateTime?
+  openSource        String?
+  // Metadados por canal (Json). No e-mail guarda {subject, from, to} para a
+  // leitura estilo cliente de e-mail (assunto/remetente/destinatário).
+  meta              Json?
+  createdAt         DateTime      @default(now())
+
+  team         Team         @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  // + ÍNDICE ÚNICO PARCIAL só no SQL (item 0.8): "Message_team_provider_uq"
+  //   (teamId, providerMessageId) WHERE providerMessageId IS NOT NULL — a mesma
+  //   mensagem do WhatsApp nunca entra duas vezes (receiveInbound: P2002 → sai).
+
+  @@index([teamId])
+  @@index([conversationId])
+  // Item 2.1 (DP-02): thread em ordem, 50 por vez.
+  @@index([conversationId, createdAt])
+  @@index([providerMessageId]) // lookup do recibo de status pelo id do provider
+  @@index([teamId, direcao, status, createdAt]) // painel de saúde: taxas por período
+}
+
+// ---------------------------------------------------------------------------
+// ChannelAccount — uma conta conectada por canal (cada número WhatsApp, cada
+// perfil de Instagram...). É a identidade de envio/recepção do time. A
+// Conversation pertence a uma ChannelAccount. Providers (Evolution, etc.) são
+// instanciados a partir de `provider` + `session`.
+//
+// credentials Json guarda SÓ identificadores não-secretos (ex.: `instance`
+// para Evolution, `number` opcional). `apiKey`/`apiUrl` da Evolution NÃO são
+// persistidos — vêm do env em packages/channels/factory.ts (assim a apikey
+// admin global nunca toca o banco, e trocar o transporte via env cura todas as
+// contas antigas). O factory usa .passthrough() p/ tolerar rows legadas que
+// ainda tragam apiUrl/apiKey do esquema anterior (ignorados em runtime, mas
+// vale um scrub de banco em contas antigas).
+// ---------------------------------------------------------------------------
+
+model ChannelAccount {
+  id              String               @id @default(uuid())
+  teamId          String
+  canal           Canal
+  label           String // "WhatsApp comercial", "Instagram @crmagro"
+  provider        String // "evolution" | "cloud_api" | "instagram_official" ...
+  credentials     Json? // { instance, number? } — só identificadores não-secretos
+  // Identificador da conta NO PROVEDOR (Evolution: o nome da instância). Único
+  // por provedor (auditoria S4/INT-18): a mesma instância não pode pertencer a
+  // dois times, e o inbound acha a conta por índice em vez de varrer todas.
+  externalId      String?
+  status          ChannelAccountStatus @default(disconnected)
+  // Quando a conexão CAIU (status virou `disconnected` pela Evolution, item
+  // 1.6). Limpa quando volta. Antes usava-se o `updatedAt`, que anda com
+  // qualquer mudança da conta (rótulo, cota, meta) e adiantava o relógio da queda.
+  desconectadaEm  DateTime?
+  // Controle de ritmo por conta (Fase B da auditoria de escala):
+  // - dailyLimit: override manual do teto de envios/dia (null = warmup automático
+  //   pela idade da conta).
+  // - warmupStartedAt: início do aquecimento (null = usa createdAt).
+  // - paused: pausado (pelo monitor de saúde por taxa de erro, ou manual) — o
+  //   motor adia os envios enquanto pausado, em vez de queimar o número.
+  dailyLimit      Int?
+  warmupStartedAt DateTime?
+  paused          Boolean              @default(false)
+  // Estado operacional NÃO secreto da conta (item 2.8). E-mail: `imap` =
+  // { uidValidity, lastUid, falhasAuth, falhasRede, proximaTentativaEm } — o
+  // cursor da leitura IMAP e o contador de falhas. Segredo fica em credentials.
+  meta            Json?
+  // Escopo por dono (plano-equipe-permissoes F3): quem conectou o número/conta. Vê as
+  // conversas: ele, o master/admin e quem tem "ver tudo" (decisão do dono 28/09).
+  ownerId         String?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  team            Team                  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  conversations   Conversation[]
+  calls           Call[]
+  usage           ChannelAccountUsage[]
+  campaigns       Campaign[]
+  emailSignatures EmailSignature[]
+  encaminhamento  EmailEncaminhamento?
+
+  @@unique([provider, externalId])
+  @@index([teamId])
+  @@index([teamId, canal])
+}
+
+// ---------------------------------------------------------------------------
+// EmailEncaminhamento — endereço de encaminhamento de uma caixa de e-mail
+// (Gmail → Cloudflare → CRM Agro, ficha E2). O token (32 hex) só existe cifrado; a
+// busca é pelo hash. Uma linha por caixa. Gerar de novo troca o token e o
+// endereço antigo deixa de valer.
+// ---------------------------------------------------------------------------
+
+model EmailEncaminhamento {
+  id               String    @id @default(uuid())
+  teamId           String
+  channelAccountId String    @unique
+  tokenHash        String    @unique // sha256 hex do token
+  tokenCifrado     Json // encryptCredentials({ token }): mostrar o endereço de novo
+  confirmacaoLink  Json? // encryptCredentials({ link }): link "vf-" do Google (E3)
+  confirmacaoEm    DateTime? // chegou o e-mail de confirmação do Google
+  confirmadoEm     DateTime? // 1º e-mail encaminhado válido (E3)
+  ultimoRecebidoEm DateTime? // só a data: nada do conteúdo
+  recusados        Int       @default(0) // chegaram sem vir da caixa (envelope estranho)
+  ultimoRecusadoEm DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  team           Team           @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  channelAccount ChannelAccount @relation(fields: [channelAccountId], references: [id], onDelete: Cascade)
+
+  @@index([teamId])
+}
+
+// ---------------------------------------------------------------------------
+// Uso diário por conta — contador de envios/dia para o teto controle de ritmo. Uma row
+// por (conta, dia-calendário no fuso do time). O motor incrementa de forma
+// atômica (updateMany condicional) e adia o envio quando bate o teto.
+// ---------------------------------------------------------------------------
+
+model ChannelAccountUsage {
+  id               String   @id @default(uuid())
+  teamId           String
+  channelAccountId String
+  day              DateTime @db.Date // dia-calendário (fuso do time), meia-noite UTC
+  sent             Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  team           Team           @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  channelAccount ChannelAccount @relation(fields: [channelAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([channelAccountId, day])
+  @@index([teamId])
+}
+
+// ---------------------------------------------------------------------------
+// Ligações (Call) — telefonemas feitos/recebidos por SDRs (~200/dia cada).
+// O provider é o transporte (voopi, whatsapp, manual); quando há uma chamada
+// no provider, `providerCallId` liga o registro à chamada remota. O motor de
+// fluxos e a UI "motor do dia" disparam calls outbounds; o webhook do provider
+// realimenta `status`, `startedAt`, `endedAt`, `durationSeconds` e
+// `recordingUrl`. Campos pesados de IA (`transcript`, `summary`,
+// `summaryEmbedding`) são preenchidos assincronamente por worker pós-chamada —
+// a row nasce leve (scheduled/created) e o processamento a enriquece.
+// ---------------------------------------------------------------------------
+
+model Call {
+  id               String        @id @default(uuid())
+  teamId           String
+  contactId        String
+  channelAccountId String? // conta conectada usada na chamada (nullable: ligações manuais)
+  phoneNumber      String // E.164 do número discado
+  phoneNumberCifrado String? // cifra em repouso (CONTATOS_CIFRA); sem índice, só se mostra
+  direction        CallDirection
+  status           CallStatus    @default(scheduled)
+  provider         String // voopi | whatsapp | manual
+  providerCallId   String? // ID da chamada no provider
+  startedAt        DateTime? // quando a ligação conectou
+  endedAt          DateTime? // quando terminou
+  durationSeconds  Int? // duração em segundos
+  outcome          CallOutcome? // resultado (produto §D); null = ainda sem resultado
+  disposition      String? // resultado da qualificação (interested, not_interested, callback, wrong_number...)
+  notes            String? // anotações do SDR durante a ligação
+  recordingUrl     String? // URL do arquivo de áudio gravado
+  transcript       String? // transcrição completa — preenchida pelo worker
+  summary          String? // resumo gerado por IA — preenchido pelo worker
+  summaryEmbedding Json? // embedding vetorial do resumo
+  // Escopo por dono (plano-equipe-permissoes F3): quem ligou.
+  userId           String?
+  // Por onde a ligação saiu (F1B-05, plano de ligação). Nulo = ligação antiga, manual ou da Voopi.
+  // A FK nasceu `NOT VALID` e foi validada numa migration à parte (tabela grande).
+  linhaId          String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  team           Team            @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contact        Contact         @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  channelAccount ChannelAccount? @relation(fields: [channelAccountId], references: [id], onDelete: SetNull)
+  linha          LinhaDeLigacao? @relation(fields: [linhaId], references: [id], onDelete: SetNull)
+
+  @@index([teamId])
+  @@index([contactId])
+  @@index([channelAccountId])
+  @@index([providerCallId]) // lookup do webhook de status pelo id do provider
+  // Painel de ligações: filtra por status dentro de um período (kpis/relatórios).
+  @@index([teamId, status, createdAt])
+  // Histórico/linha do tempo de um contato (calls ordenadas por data).
+  @@index([contactId, createdAt])
+  // Ligações de uma linha (placar por linha, varredura): criado com CONCURRENTLY, sozinho na migration.
+  @@index([linhaId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// LinhaDeLigacao (F1B-05, plano de ligação): por onde alguém liga. Um ramal, um número de WhatsApp ou um
+// aparelho, no CNPJ da empresa cliente. `userId` é o vendedor dono da linha; nulo = linha do time
+// (compartilhada). Cada pessoa tem no máximo UMA linha padrão (`padrao`).
+//
+// - `provedor` é a chave do registro de provedores (`calls/provedor/registro.ts`), `tipo` e `estado` são
+//   validados por zod no serviço (`calls/nucleo/linhas.ts`), não por enum do banco.
+// - `(provedor, contaExterna, idExterno)` é único no SISTEMA TODO: o time sai da linha (nunca do corpo do
+//   webhook), então a mesma linha não pode existir em dois times.
+// - `credentials` guarda o que é só desta linha (senha do ramal, token da pessoa), CIFRADO pela extensão do
+//   `db()` (AES-256-GCM, mesmo anel de chaves da Integration) e coberto por `recifrar-credenciais.ts`.
+//   Nunca volta à tela: a listagem mostra só os últimos 4 caracteres.
+// - `webhookVersao` entra no endereço assinado do aviso (F1B-06): somar 1 revoga o endereço antigo.
+// - `pausadaAte` é lido pelo varredor que reativa a linha (F2-20); o serviço só grava.
+//
+// Índice PARCIAL só no SQL (o Prisma não expressa `WHERE`), criado na migration `linha_de_ligacao`:
+//   "LinhaDeLigacao_teamId_userId_padrao_key" ÚNICO em (teamId, userId) WHERE padrao
+// Garante uma linha padrão por pessoa mesmo com duas trocas ao mesmo tempo (a segunda perde com P2002).
+// ---------------------------------------------------------------------------
+
+model LinhaDeLigacao {
+  id            String    @id @default(uuid())
+  teamId        String
+  provedor      String
+  tipo          String // ramal | numero_whatsapp | dispositivo
+  contaExterna  String
+  idExterno     String
+  integrationId String?
+  userId        String?
+  padrao        Boolean   @default(false)
+  rotulo        String?
+  numeroExibido String?
+  estado        String    @default("ativa") // ativa | pausada | desativada
+  motivoPausa   String?
+  pausadaAte    DateTime?
+  credentials   Json?
+  webhookVersao Int       @default(1)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  team        Team         @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  integration Integration? @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+  user        User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  chamadas    Call[]
+
+  @@unique([provedor, contaExterna, idExterno])
+  @@index([teamId])
+  @@index([teamId, userId])
+}
+
+// ---------------------------------------------------------------------------
+// Funis / Etapas / Deals (o "lead" no funil)
+// ---------------------------------------------------------------------------
+
+model Funnel {
+  id        String     @id @default(uuid())
+  teamId    String
+  nome      String
+  // Código estável do funil — referência das automações (nó update_stage e
+  // gatilho stage_changed apontam por código, não por id volátil). Gerado no
+  // create; único por time. Nullable p/ rows legadas (backfill na migration).
+  codigo    String?
+  tipo      FunnelTipo
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  team   Team    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  stages Stage[]
+  deals  Deal[]
+
+  @@unique([teamId, codigo])
+  @@index([teamId])
+}
+
+model Stage {
+  id        String   @id @default(uuid())
+  teamId    String
+  funnelId  String
+  nome      String
+  // Código estável da etapa — as automações definem "mover para etapa X" por
+  // este código (rastreável mesmo se o nome mudar). Único dentro do funil.
+  codigo    String?
+  ordem     Int
+  cor       String?
+  createdAt DateTime @default(now())
+
+  team   Team   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  funnel Funnel @relation(fields: [funnelId], references: [id], onDelete: Cascade)
+  deals  Deal[]
+
+  @@unique([funnelId, ordem])
+  @@unique([funnelId, codigo])
+  @@index([teamId])
+  @@index([funnelId])
+}
+
+model Deal {
+  id             String     @id @default(uuid())
+  teamId         String
+  funnelId       String
+  stageId        String
+  contactId      String
+  valor          Decimal    @default(0) @db.Decimal(12, 2)
+  status         DealStatus @default(open)
+  enteredStageAt DateTime   @default(now()) // indexado (motor do dia)
+  // Escopo por dono (plano-equipe-permissoes F3): o negócio é de quem o criou/recebeu
+  // (padrão: o dono do contato). Coluna simples: excluir alguém transfere antes.
+  ownerId        String?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  team    Team    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  funnel  Funnel  @relation(fields: [funnelId], references: [id], onDelete: Cascade)
+  stage   Stage   @relation(fields: [stageId], references: [id], onDelete: Restrict)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([teamId])
+  @@index([stageId])
+  @@index([enteredStageAt])
+  // listaDoDia filtra status=open + enteredStageAt (deals parados).
+  @@index([teamId, status, enteredStageAt])
+  // Item 2.1 (DP-08): negócios do contato e cartões do funil por status.
+  @@index([contactId, status])
+  @@index([funnelId, status])
+  @@index([teamId, ownerId]) // escopo por dono (F3)
+}
+
+// ---------------------------------------------------------------------------
+// Flow / FlowNode / Enrollment — o motor
+// ---------------------------------------------------------------------------
+
+model Flow {
+  id            String      @id @default(uuid())
+  teamId        String
+  nome          String
+  triggerType   TriggerType
+  triggerConfig Json?
+  tipo          FlowTipo    @default(prospeccao)
+  // Segredo do gatilho Webhook (auditoria S5): gerado NO SERVIDOR, único GLOBAL.
+  // A URL pública é /api/webhooks/flow/<token>. O lookup é pelo HASH (webhookTokenHash, sha256 hex):
+  // o texto puro só existe aqui para os fluxos criados antes do hash (e para quem desligar a chave
+  // FLOW_WEBHOOK_TOKEN_HASH) e é apagado pelo script script de operação
+  // Legado: não grave texto novo sem passar por `dadosDoTokenNovo` (core/flows/webhook-token.ts).
+  // (Espelhado em triggerConfig.webhookToken só enquanto o texto puro for gravado.)
+  webhookToken  String?     @unique
+  // sha256 hex do token. Único: um token = um fluxo.
+  webhookTokenHash String?  @unique
+  // Quando a URL atual foi gerada (a tela diz "URL gerada em..."). Nulo em quem veio do backfill.
+  webhookTokenGeradoEm DateTime?
+  status        FlowStatus  @default(draft)
+  // Escopo por dono (plano-equipe-permissoes F3): quem criou; "compartilhado" = o time todo vê
+  // (os fluxos que já existiam nascem compartilhados no backfill).
+  createdById   String?
+  compartilhado Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  team        Team          @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  nodes       FlowNode[]
+  enrollments Enrollment[]
+  versions    FlowVersion[]
+  campaigns   Campaign[]
+
+  @@index([teamId])
+}
+
+model FlowNode {
+  id         String       @id @default(uuid())
+  teamId     String
+  flowId     String
+  tipo       FlowNodeType
+  config     Json?
+  nextNodeId String? // id do próximo nó (resolvido pelo motor; não é FK — snapshot pode referenciar nós removidos)
+  branches   Json?
+  // Posição do nó no canvas do editor (React Flow). Persistir isto conserta o
+  // bug de "desordena tudo ao salvar" — sem posição, o editor re-organizava os
+  // nós numa grade por índice a cada recarregamento. Nullable p/ rows legadas.
+  posX       Float?
+  posY       Float?
+  createdAt  DateTime     @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  flow Flow @relation(fields: [flowId], references: [id], onDelete: Cascade)
+
+  @@index([teamId])
+  @@index([flowId])
+}
+
+model Enrollment {
+  id              String           @id @default(uuid())
+  // RAMO paralelo: saída da condição com vários destinos cria uma inscrição filha por destino extra, que segue o
+  // próprio caminho ao mesmo tempo. Guarda o id da inscrição de ORIGEM (a que nasceu por gatilho/ação, nunca um ramo).
+  // Sem FK de propósito (como `nextNodeId`): ramos nascem e morrem junto com o fluxo/contato por cascata.
+  paiId           String?
+  teamId          String
+  flowId          String
+  contactId       String
+  currentNodeId   String
+  status          EnrollmentStatus @default(active)
+  nextRunAt       DateTime? // indexado (motor do dia / waits)
+  flowSnapshot    Json? // grafo congelado na entrada — só inscrição ANTIGA; a nova aponta para FlowVersion (item 2.7)
+  lastOutboundAt  DateTime? // base temporal do condition "respondeu?" (último send_message do enrollment)
+  stepNumber      Int              @default(0) // contador monotônico p/ ordenação/observabilidade
+  // Round do PRÓXIMO passo devido (junto com currentNodeId/nextRunAt é o
+  // "ponteiro" da inscrição). Gravado na MESMA transação que fecha o passo
+  // anterior (item 0.9, MF-01): se o agendamento no Redis falhar, a varredura
+  // reconstrói o jobId `${id}:${currentNodeId}:${currentRound}`. 0 = inscrição
+  // anterior a esta coluna (a varredura calcula pelo histórico).
+  currentRound    Int              @default(0)
+  // Espera ORIENTADA A EVENTO (item 1.1, MF-02): condição "respondeu?" com
+  // janela aberta e sem resposta grava waitingFor="reply" + waitingUntil (fim
+  // da janela) e deixa UM job de timeout. A mensagem recebida acorda a inscrição
+  // na hora (receiveInbound) — antes era poll a cada 30 s, que saturava o motor.
+  waitingFor      String?
+  waitingUntil    DateTime?
+  // Profundidade de gatilho (item 1.4, MF-08): 0 = inscrita por ação humana ou
+  // evento externo; N = inscrita por uma cascata do PRÓPRIO motor (mover etapa →
+  // stage_changed, trocar de fluxo). Acima de 2 não inscreve: corta ciclos
+  // A→B→A entre fluxos.
+  profundidade    Int              @default(0)
+  // Versão do formato do flowSnapshot (item 1.9, MF-18): o worker lê o nó
+  // corrente pela versão em que a inscrição nasceu — mudar o schema dos nós não
+  // derruba mais as inscrições em voo (migrador em flows/snapshot.ts).
+  snapshotVersion Int              @default(1)
+  // Versão do fluxo (item 2.7, DP-14): o grafo congelado mora UMA vez na
+  // FlowVersion (deduplicada por hash) e a inscrição só aponta para ela. Nula =
+  // inscrição anterior à tabela, que continua lendo o `flowSnapshot` acima.
+  flowVersionId   String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  team           Team                @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  flow           Flow                @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  contact        Contact             @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  // NoAction (checado no fim do comando): apagar o fluxo/time leva versões e
+  // inscrições juntas; apagar SÓ a versão com inscrição apontando é recusado.
+  flowVersion    FlowVersion?        @relation(fields: [flowVersionId], references: [id], onDelete: NoAction)
+  stepExecutions FlowStepExecution[]
+  // + ÍNDICE ÚNICO PARCIAL só no SQL (item 0.9, MF-04): "Enrollment_um_ativo"
+  //   (flowId, contactId) WHERE status IN ('active','waiting') AND "paiId" IS NULL — o mesmo contato
+  //   não percorre o mesmo fluxo duas vezes ao mesmo tempo (mensagem em dobro). Ramos (paiId) ficam de fora.
+
+  @@index([teamId])
+  @@index([flowId])
+  @@index([nextRunAt])
+  @@index([contactId, status])
+  // Item 2.1 (DP-08): "lista do dia" e revisão por time (status + vencimento).
+  @@index([teamId, status, nextRunAt])
+  // Item 2.7: FK para FlowVersion (apagar versão confere as inscrições por aqui).
+  @@index([flowVersionId])
+  @@index([paiId])
+}
+
+// Versão congelada do grafo de um fluxo (item 2.7, DP-14). Antes cada
+// Enrollment.flowSnapshot guardava o grafo inteiro (textos, prompts de IA): uma
+// tag aplicada a 5 mil contatos gravava 5 mil cópias iguais. Agora a inscrição
+// aponta para a versão; o mesmo grafo (hash do JSON canônico + versão do
+// formato) reaproveita a mesma linha. Imutável: nunca é atualizada, por isso o
+// worker a guarda em cache por id.
+model FlowVersion {
+  id        String   @id @default(uuid())
+  teamId    String
+  flowId    String
+  hash      String // sha256 do snapshot canônico (flows/versao.ts)
+  snapshot  Json // SnapshotNode[] — mesmo formato do antigo Enrollment.flowSnapshot
+  createdAt DateTime @default(now())
+
+  team        Team         @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  flow        Flow         @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  enrollments Enrollment[]
+
+  @@unique([flowId, hash])
+  @@index([teamId])
+}
+
+// Log append-only de cada execução de passo. A unicidade em
+// (enrollmentId, nodeId, round) é a idempotência real: permite loops
+// (round distinto por iteração) mas bloqueia reprocessamento do mesmo round.
+// O handler do worker trata P2002 (unique conflict) como "já executei, skip".
+model FlowStepExecution {
+  id           String                  @id @default(uuid())
+  teamId       String
+  enrollmentId String
+  nodeId       String
+  round        Int // N-ésima entrada neste nó para este enrollment
+  jobId        String? // BullMQ jobId (= enrollmentId:nodeId:round)
+  status       FlowStepExecutionStatus @default(running)
+  result       Json? // { nextNodeId, delayMs, skipped, ... }
+  error        String?
+  startedAt    DateTime                @default(now())
+  finishedAt   DateTime?
+
+  team       Team       @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  enrollment Enrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+
+  @@unique([enrollmentId, nodeId, round])
+  @@index([teamId])
+  @@index([enrollmentId])
+}
+
+// ---------------------------------------------------------------------------
+// Integrações (credentials: mesma regra de ChannelAccount — só identificadores
+// não-secretos em Json; segredos ficam em env. Ainda sem providers ativos.)
+// ---------------------------------------------------------------------------
+
+model Integration {
+  id          String            @id @default(uuid())
+  teamId      String
+  tipo        IntegrationTipo
+  credentials Json? // CRIPTOGRAFAR (Fase 3)
+  status      IntegrationStatus @default(disconnected)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  team   Team             @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  linhas LinhaDeLigacao[]
+
+  @@index([teamId])
+}
+
+// ---------------------------------------------------------------------------
+// Importação de contatos em 4 passos (produto §C). A planilha vai para o
+// Storage privado (`imports/<teamId>/<id>.csv`) e o worker processa em blocos
+// (fila `import`, uma por time por vez). As contagens são as da tela:
+// criadas = novos · atualizadas = já existiam (completados) · puladas =
+// repetidas na planilha (unidas à 1ª) · invalidas = linhas recusadas (`erros`).
+// ---------------------------------------------------------------------------
+
+enum ImportJobStatus {
+  queued
+  processing
+  done
+  failed
+  canceled
+}
+
+model ImportJob {
+  id          String          @id @default(uuid())
+  teamId      String
+  status      ImportJobStatus @default(queued)
+  nomeArquivo String
+  arquivoPath String? // null depois que o arquivo sai do Storage
+  mapeamento  Json // (campo | null)[] — um por coluna da planilha
+  opcoes      Json // { origem?, existentes: "completar" | "pular" }
+  total       Int             @default(0) // linhas de dados da planilha
+  processadas Int             @default(0)
+  criadas     Int             @default(0)
+  atualizadas Int             @default(0)
+  puladas     Int             @default(0)
+  invalidas   Int             @default(0)
+  erros       Json? // [{ linha, motivo }] (amostra limitada)
+  createdById String?
+  iniciadoEm  DateTime?
+  concluidoEm DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([teamId, createdAt(sort: Desc)])
+}
+
+// ---------------------------------------------------------------------------
+// Campanhas (produto §A): UMA mensagem para uma LISTA, com RITMO anti-bloqueio.
+// O "depois" (resposta) fica com o fluxo `flowId` ("Pós-resposta").
+//
+// Controle de ritmo NÃO é reimplementado aqui: o envio passa pela cota por número com
+// aquecimento (`consumeSendQuota`), pela janela do time (item 1.3) e pelo
+// limite por contato (item 1.4). A campanha só acrescenta o próprio ritmo
+// (intervalo sorteado, lotes, janela da campanha) e os freios.
+// ---------------------------------------------------------------------------
+
+enum CampaignStatus {
+  draft
+  scheduled
+  sending
+  paused
+  done
+  canceled
+}
+
+// `sending` = reservado por um tick (claim) — ver `reservadoEm`/`enviandoEm`.
+enum RecipientStatus {
+  queued
+  sending
+  held
+  skipped
+  sent
+  delivered
+  read
+  replied
+  opted_out
+  failed
+}
+
+model Campaign {
+  id                String         @id @default(uuid())
+  teamId            String
+  nome              String
+  status            CampaignStatus @default(draft)
+  etapa             Int            @default(1) // 1 lista · 2 mensagem · 3 ritmo · 4 revisar
+  channelAccountId  String? // número que envia
+  // Lista
+  listaOrigem       Json? // { tipo: "planilha"|"colados"|"filtro", arquivo?, filtro?, linhas? }
+  regraJaConversou  String         @default("hold") // hold | skip | retomada
+  diasSemCampanha   Int            @default(30) // pula quem recebeu campanha há menos de N dias
+  // Mensagem
+  mensagem          String? // template com {saudacao} {primeiro_nome|tudo bem} ...
+  variacoes         Json? // ["...", "..."] sorteadas por contato (determinístico)
+  textoRetomada     String? // para quem já conversou (regra "retomada")
+  // Ritmo — padrões da decisão 7 do plano (confirmado pelo dono em 27/09),
+  // configuráveis por campanha.
+  limiteDiario      Int? // null = só o aquecimento da conta
+  janelaInicio      String         @default("08:30")
+  janelaFim         String         @default("17:30")
+  pausaAlmocoInicio String?        @default("11:30")
+  pausaAlmocoFim    String?        @default("13:30")
+  intervaloMinS     Int            @default(60)
+  intervaloMaxS     Int            @default(180)
+  loteTamanho       Int            @default(20)
+  pausaLoteMinM     Int            @default(15)
+  pausaLoteMaxM     Int            @default(25)
+  freioSaidasPct    Int            @default(3) // pausa se pedidos de saída > 3% dos enviados
+  freioFalhasSeq    Int            @default(5) // pausa se 5 falhas seguidas
+  // Execução (worker, item A.3)
+  flowId            String? // fluxo disparado na resposta (Pós-resposta)
+  iniciaEm          DateTime?
+  terminoPrevisto   DateTime?
+  pausadoMotivo     String?
+  // Corrente de ticks válida: tick com outro token sai sem fazer nada (retomar
+  // cria corrente nova; a antiga morre sozinha).
+  tickToken         String?
+  enviadosNoLote    Int            @default(0)
+  falhasSeguidas    Int            @default(0)
+  ultimoEnvioEm     DateTime?
+  iniciadaEm        DateTime?
+  concluidaEm       DateTime?
+  createdById       String?
+  // Escopo por dono (plano-equipe-permissoes F3): "compartilhado" = o time todo vê (F4).
+  compartilhado     Boolean        @default(false)
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  team           Team                @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  channelAccount ChannelAccount?     @relation(fields: [channelAccountId], references: [id], onDelete: SetNull)
+  flow           Flow?               @relation(fields: [flowId], references: [id], onDelete: SetNull)
+  recipients     CampaignRecipient[]
+
+  @@index([teamId, status])
+  @@index([teamId, createdAt(sort: Desc)])
+  @@index([channelAccountId])
+  @@index([flowId])
+}
+
+model CampaignRecipient {
+  id                String          @id @default(uuid())
+  teamId            String
+  campaignId        String
+  contactId         String
+  status            RecipientStatus @default(queued)
+  motivo            String? // "já conversou" | "sem WhatsApp" | "duplicado" | "campanha há 12 dias" | "pediu para sair"
+  telefone          String? // E.164 da lista
+  telefoneCifrado   String? // cifra em repouso (CONTATOS_CIFRA); sem índice, só se mostra
+  variacao          Int?
+  // Envio com MARCAS (padrão do item 1.2): reservadoEm = claim do tick;
+  // enviandoEm = gravado logo antes de chamar o canal. `sending` com
+  // enviandoEm preenchido e sem `sent` = resultado incerto → segura, nunca
+  // reenvia sozinho.
+  reservadoEm       DateTime?
+  enviandoEm        DateTime?
+  tentativas        Int             @default(0) // falhas "não saiu" (retry com backoff)
+  providerMessageId String? // id no WhatsApp: liga os recibos ✓✓ ao destinatário
+  messageId         String? // Message enviada
+  scheduledAt       DateTime? // não antes de (retry/limite do contato)
+  sentAt            DateTime?
+  repliedAt         DateTime?
+  classificacao     String? // interessada | pediu_depois | duvida | saiu | outro (IA)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  team     Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contact  Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, contactId])
+  // Próximo da fila (ordem de criação) e contadores por status (groupBy).
+  @@index([campaignId, status, createdAt])
+  // "Recebeu campanha há menos de N dias" e resposta do contato.
+  @@index([contactId, sentAt])
+  // Recibo do WhatsApp (providerMessageId) → destinatário.
+  @@index([teamId, providerMessageId])
+}
+
+// "Tem WhatsApp?" (item A.4) — cache GLOBAL da consulta à Evolution
+// (/chat/whatsappNumbers), sem teamId: o fato "este número tem WhatsApp" é o
+// mesmo para qualquer time e não carrega dado além do número. Validade de 30
+// dias (conferida na leitura).
+model WhatsAppNumberCheck {
+  numero    String   @id // E.164
+  existe    Boolean
+  jid       String?
+  checkedAt DateTime @default(now())
+
+  @@index([checkedAt])
+}
+
+// Mapa (produto §B.1) — cache GLOBAL de geocodificação, sem teamId e sem
+// vínculo com pessoa: só "endereço normalizado → coordenada". O mesmo endereço
+// público vale para qualquer time, e o provedor (Nominatim: 1 req/s para a
+// plataforma inteira) é consultado uma vez só. Coordenada nula + precisão
+// "nenhuma" = o provedor não achou (não pergunta de novo).
+model GeoCache {
+  chave     String   @id // endereço normalizado ("rua x 123|sorriso|mt" ou "sorriso|mt")
+  latitude  Float?
+  longitude Float?
+  precisao  String // "endereco" | "cidade" | "nenhuma"
+  fonte     String // "nominatim" | "ibge" | "google"
+  createdAt DateTime @default(now())
+}
+
+// Mapa (produto §B.1) — centroides dos municípios (IBGE), referência pública,
+// sem teamId. Semeado uma vez por packages/db/scripts/seed-municipios.ts.
+// `nomeBusca` = nome sem acento, minúsculo e sem pontuação: a busca por
+// "cidade/UF" não depende de como o contato digitou.
+model Municipio {
+  codigoIbge Int    @id
+  nome       String
+  nomeBusca  String
+  uf         String
+  latitude   Float
+  longitude  Float
+
+  @@unique([uf, nomeBusca])
+}
+
+/// Camada do mapa (produto §B): agrupamento nomeado de contatos, com cor
+/// própria, que a pessoa liga/desliga na tela — como as camadas do Google
+/// My Maps. Um contato fica em no máximo uma camada (`Contact.camadaId`).
+model MapaCamada {
+  id        String   @id @default(uuid())
+  teamId    String
+  nome      String
+  cor       String   @default("#1F4A3A") // hex
+  ordem     Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team     Team      @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  contatos Contact[]
+
+  @@unique([teamId, nome])
+  @@index([teamId, ordem])
+}
+
+/// Base de conhecimento da empresa (Integrações → IA): textos e arquivos (PDF, Word, Excel, link do Google)
+/// que o Agente IA e o Assistente consultam para saber como é a empresa e não inventar. O texto já vem
+/// extraído (`conteudo`); a busca por trechos roda em memória (`core/conhecimento/trechos.ts`).
+model KnowledgeDoc {
+  id          String   @id @default(uuid())
+  teamId      String
+  titulo      String
+  /// "texto" | "pdf" | "word" | "excel" | "google"
+  fonte       String
+  nomeArquivo String?
+  /// Link do Google Docs/Planilhas/Drive (para atualizar de novo).
+  linkOrigem  String?
+  conteudo    String   @db.Text
+  caracteres  Int
+  ativo       Boolean  @default(true)
+  criadoPorId String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([teamId, ativo])
+}
+
+/// Metodologia de abordagem (Integrações → IA → Metodologias): como o agente conduz a conversa (SPIN Selling,
+/// BANT, a do próprio time). Cada uma tem uma FINALIDADE (onde aparece e onde vale) e há no máximo UMA padrão
+/// por finalidade (índice único parcial no SQL). O texto (`conteudo`) vai para o prompt da IA.
+model Methodology {
+  id          String   @id @default(uuid())
+  teamId      String
+  nome        String
+  /// "agente_fluxo" (nó Agente IA dos fluxos) | "assistente_chat" (Assistente da barra superior) | "captacao" (reservada)
+  finalidade  String
+  descricao   String?
+  conteudo    String   @db.Text
+  padrao      Boolean  @default(false)
+  /// De qual modelo pronto nasceu ("spin_selling", "bant", "consultiva"), se nasceu de um.
+  modelo      String?
+  criadoPorId String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([teamId, finalidade])
+}
+
+// ---------------------------------------------------------------------------
+// ConsultaDocumento — registro de consulta PAGA de dado de pessoa (nome, CPF, IE) feita pelo
+// Enriquecer ou pela Captação: quem, quando, por quê, em que fonte e quanto custou (LGPD). O
+// documento NUNCA fica em claro: só a impressão (HMAC por time) e o mascarado. A pedido do
+// titular, `documentoMascarado`, `motivo` e `contactId` são apagados e a linha fica só como
+// contagem de cota e de custo
+// ---------------------------------------------------------------------------
+model ConsultaDocumento {
+  id                 String   @id @default(uuid())
+  teamId             String
+  userId             String
+  criadoEm           DateTime @default(now())
+  tipo               String // "nome" | "cpf" | "ie" | "cnpj"
+  documentoHmac      String
+  documentoMascarado String?
+  uf                 String?
+  motivo             String?
+  fonte              String // "cnpja" | ...
+  creditos           Int      @default(0)
+  custoCentavos      Int?
+  contactId          String?
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([teamId, criadoEm])
+  @@index([teamId, fonte, criadoEm])
+}
+
+// ---------------------------------------------------------------------------
+// Alertas de saúde do servidor.
+// Os alertas são do servidor, não de um time: por isso estas duas tabelas
+// NÃO têm `teamId` e só o papel dono do banco toca nelas (`basePrisma`; o `crmagro_app`
+// fica sem privilégio). A leitura e a escrita moram em core/health/alertas-config.ts.
+// Exceção documentada na documentação interna.
+// ---------------------------------------------------------------------------
+
+/// Configuração dos alertas: UMA linha só (id fixo "plataforma"). Sem a linha, vale o
+/// `.env` (ALERT_EMAILS e ALERT_TEAM_ID), como antes da tela. `emails` guarda endereços
+/// de quem opera (dado pessoal mínimo: só quem recebe o alerta).
+model AlertaConfig {
+  id                 String   @id // sempre "plataforma"
+  ligado             Boolean  @default(true)
+  emails             String[] @default([])
+  canalEmail         Boolean  @default(true)
+  canalPush          Boolean  @default(true)
+  /// Chaves dos motivos DESLIGADOS (banco, redis, whatsapp, worker, motor_filas,
+  /// motor_inscricoes, email_plataforma). Vazio = todos alertam; motivo novo nasce ligado.
+  motivosDesligados  String[] @default([])
+  /// Menor espera, em minutos, entre dois avisos do mesmo motivo (30, 120 ou 360).
+  intervaloMinimoMin Int      @default(30)
+  /// Time de operação: recebe o Web Push e é a caixa do aviso quando não há remetente da
+  /// plataforma. Sem valor, vale o ALERT_TEAM_ID do `.env`.
+  timeOperacaoId     String?
+  atualizadoPorId    String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+/// Registro de cada alerta enviado (ou que falhou): só a CATEGORIA do motivo, o canal e a
+/// hora. Nunca o texto do erro (pode ter host do banco), nem o endereço de quem recebeu.
+model AlertaEnviado {
+  id            String   @id @default(uuid())
+  criadoEm      DateTime @default(now())
+  /// "email" | "push" | "teste"
+  canal         String
+  /// Categoria (banco, redis, whatsapp, worker, motor_filas, motor_inscricoes,
+  /// email_plataforma) ou "teste".
+  motivo        String
+  /// Status do relatório de saúde na hora ("degraded" | "unhealthy") ou "teste".
+  status        String
+  /// "enviado" | "falhou"
+  resultado     String
+  destinatarios Int      @default(0)
+
+  @@index([criadoEm])
+}

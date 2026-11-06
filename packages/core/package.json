@@ -1,0 +1,43 @@
+{
+  "name": "@crmagro/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./contacts": "./src/contacts/index.ts",
+    "./funnels": "./src/funnels/index.ts",
+    "./flows": "./src/flows/index.ts",
+    "./operacao": "./src/auth/master-operacao.ts",
+    "./email-plataforma": "./src/email/plataforma-exports.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "dotenv -e ../../.env -- sh -c 'unset DATABASE_URL_APP DATABASE_URL_APP_WORKER; DATABASE_URL=\"$DATABASE_URL_TEST\" DIRECT_URL=\"$DIRECT_URL_TEST\" REDIS_URL=\"${REDIS_URL_TEST:-$REDIS_URL}\" vitest run'",
+    "test:watch": "dotenv -e ../../.env -- sh -c 'unset DATABASE_URL_APP DATABASE_URL_APP_WORKER; DATABASE_URL=\"$DATABASE_URL_TEST\" DIRECT_URL=\"$DIRECT_URL_TEST\" REDIS_URL=\"${REDIS_URL_TEST:-$REDIS_URL}\" vitest'"
+  },
+  "dependencies": {
+    "@crmagro/captation": "workspace:*",
+    "@crmagro/channels": "workspace:*",
+    "@crmagro/config": "workspace:*",
+    "@crmagro/db": "workspace:*",
+    "bullmq": "^5.30.0",
+    "exceljs": "^4.4.0",
+    "ioredis": "^5.4.2",
+    "jszip": "^3.10.1",
+    "papaparse": "^5.4.1",
+    "pino": "^10.3.1",
+    "unpdf": "^1.8.1",
+    "web-push": "^3.6.7",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/papaparse": "^5.3.14",
+    "@types/web-push": "^3.6.4",
+    "pino-pretty": "^13.1.3",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.8"
+  }
+}

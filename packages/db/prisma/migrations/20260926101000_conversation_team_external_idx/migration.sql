@@ -1,0 +1,3 @@
+-- Item 2.1 (plano de backend 09/2026). CONCURRENTLY: não trava escrita; um
+-- statement por arquivo (CONCURRENTLY não roda dentro de transação).
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "Conversation_teamId_externalNumber_idx" ON "Conversation"("teamId", "externalNumber");

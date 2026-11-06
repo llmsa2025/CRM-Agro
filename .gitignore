@@ -1,0 +1,54 @@
+# deps
+node_modules/
+.pnp
+.pnp.js
+
+# build (qualquer saída do Next: .next, .next-test...)
+.next*/
+out/
+dist/
+build/
+
+# env: nunca versionar segredos
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# os/editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# tsbuildinfo / next
+*.tsbuildinfo
+next-env.d.ts
+
+# misc
+coverage/
+.turbo/
+.vercel
+
+# chaves e credenciais
+*.pem
+*.key
+*.p12
+.pgpass
+*.bak
+
+# backups locais (nunca versionar dump de banco)
+/backups/
+*.dump
+*.sql.gz
+
+# Worker do MapLibre copiado no build (apps/web/scripts/copiar-maplibre-worker.mjs)
+apps/web/public/maplibre/
+
+# arquivos temporários dos scripts de demo
+/tmp-demo/

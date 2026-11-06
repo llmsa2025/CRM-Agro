@@ -1,0 +1,46 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "jsx": "preserve",
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ES2022"
+    ],
+    "incremental": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./*"],
+      "@crmagro/config": [
+        "../../packages/config/src/index.ts"
+      ],
+      "@crmagro/db": [
+        "../../packages/db/src/index.ts"
+      ],
+      "@crmagro/core": [
+        "../../packages/core/src/index.ts"
+      ],
+      "@crmagro/channels": [
+        "../../packages/channels/src/index.ts"
+      ],
+      "@crmagro/captation": [
+        "../../packages/captation/src/index.ts"
+      ]
+    },
+    "allowJs": true
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
